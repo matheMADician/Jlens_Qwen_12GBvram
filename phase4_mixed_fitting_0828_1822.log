@@ -1,66 +1,0 @@
-2026-08-28 18:32:55,696 [INFO] Loading metadata from g_data/jlens_dataset_qa/prompts.jsonl
-2026-08-28 18:32:55,696 [INFO] Loaded 100 samples
-2026-08-28 18:32:55,696 [INFO] Loading model Qwen/Qwen2-Audio-7B-Instruct in 4-bit (nf4) ...
-2026-08-28 18:32:55,978 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
-Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-2026-08-28 18:32:55,978 [WARNING] Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
-2026-08-28 18:32:55,983 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2-Audio-7B-Instruct/0a095220c30b7b31434169c3086508ef3ea5bf0a/config.json "HTTP/1.1 200 OK"
-2026-08-28 18:32:56,694 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/model.safetensors "HTTP/1.1 404 Not Found"
-2026-08-28 18:32:56,889 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/model.safetensors.index.json "HTTP/1.1 307 Temporary Redirect"
-2026-08-28 18:32:56,896 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2-Audio-7B-Instruct/0a095220c30b7b31434169c3086508ef3ea5bf0a/model.safetensors.index.json "HTTP/1.1 200 OK"
-2026-08-28 18:32:57,091 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen2-Audio-7B-Instruct/revision/main "HTTP/1.1 200 OK"
-Fetching 5 files:   0%|          | 0/5 [00:00<?, ?it/s]Fetching 5 files: 100%|██████████| 5/5 [00:00<00:00, 3226.88it/s]
-Loading weights:   0%|          | 0/876 [00:00<?, ?it/s]Loading weights:  19%|█▉        | 168/876 [00:00<00:00, 1678.80it/s]Loading weights:  46%|████▌     | 399/876 [00:00<00:00, 2030.45it/s]Loading weights:  69%|██████▊   | 602/876 [00:00<00:00, 549.94it/s] Loading weights:  83%|████████▎ | 726/876 [00:01<00:00, 419.56it/s]Loading weights:  93%|█████████▎| 812/876 [00:01<00:00, 371.15it/s]Loading weights: 100%|██████████| 876/876 [00:01<00:00, 345.98it/s]Loading weights: 100%|██████████| 876/876 [00:01<00:00, 453.32it/s]
-2026-08-28 18:32:59,981 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/generation_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-08-28 18:32:59,986 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2-Audio-7B-Instruct/0a095220c30b7b31434169c3086508ef3ea5bf0a/generation_config.json "HTTP/1.1 200 OK"
-2026-08-28 18:33:00,176 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-08-28 18:33:00,373 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-08-28 18:33:00,380 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2-Audio-7B-Instruct/0a095220c30b7b31434169c3086508ef3ea5bf0a/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-08-28 18:33:00,576 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-08-28 18:33:00,772 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-08-28 18:33:00,779 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2-Audio-7B-Instruct/0a095220c30b7b31434169c3086508ef3ea5bf0a/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-08-28 18:33:00,975 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen2-Audio-7B-Instruct/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
-2026-08-28 18:33:01,175 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-08-28 18:33:01,371 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/chat_template.json "HTTP/1.1 404 Not Found"
-2026-08-28 18:33:01,571 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/chat_template.jinja "HTTP/1.1 404 Not Found"
-2026-08-28 18:33:01,768 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/audio_tokenizer_config.json "HTTP/1.1 404 Not Found"
-2026-08-28 18:33:01,969 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-08-28 18:33:02,170 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-08-28 18:33:02,177 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2-Audio-7B-Instruct/0a095220c30b7b31434169c3086508ef3ea5bf0a/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-08-28 18:33:02,373 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/processor_config.json "HTTP/1.1 404 Not Found"
-2026-08-28 18:33:02,567 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/preprocessor_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-08-28 18:33:02,573 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2-Audio-7B-Instruct/0a095220c30b7b31434169c3086508ef3ea5bf0a/preprocessor_config.json "HTTP/1.1 200 OK"
-2026-08-28 18:33:02,767 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/config.json "HTTP/1.1 307 Temporary Redirect"
-2026-08-28 18:33:02,774 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2-Audio-7B-Instruct/0a095220c30b7b31434169c3086508ef3ea5bf0a/config.json "HTTP/1.1 200 OK"
-2026-08-28 18:33:02,979 [INFO] HTTP Request: HEAD https://huggingface.co/Qwen/Qwen2-Audio-7B-Instruct/resolve/main/tokenizer_config.json "HTTP/1.1 307 Temporary Redirect"
-2026-08-28 18:33:02,985 [INFO] HTTP Request: HEAD https://huggingface.co/api/resolve-cache/models/Qwen/Qwen2-Audio-7B-Instruct/0a095220c30b7b31434169c3086508ef3ea5bf0a/tokenizer_config.json "HTTP/1.1 200 OK"
-2026-08-28 18:33:03,190 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen2-Audio-7B-Instruct/tree/main/additional_chat_templates?recursive=false&expand=false "HTTP/1.1 404 Not Found"
-2026-08-28 18:33:03,396 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen2-Audio-7B-Instruct/tree/main?recursive=true&expand=false "HTTP/1.1 200 OK"
-2026-08-28 18:33:03,861 [INFO] HTTP Request: GET https://huggingface.co/api/models/Qwen/Qwen2-Audio-7B-Instruct "HTTP/1.1 200 OK"
-2026-08-28 18:33:03,869 [INFO] Filtering samples by length (max_seq_len=300) before fitting...
-2026-08-28 18:33:04,696 [INFO] 長度過濾完成：保留 100 / 100 筆
-2026-08-28 18:33:04,699 [INFO] Fitting all 32 layers together: source_layers=0..30, target_layer=31
-2026-08-28 18:33:04,699 [INFO] dim_batch=4, max_seq_len=300, checkpoint_every=1, checkpoint_path=checkpoints/phase4_qa_lens.ckpt
-2026-08-28 18:33:04,699 [INFO] fit: n_layers=32 d_model=4096, fitting 31 source layers (target=L31) on 100 prompts
-2026-08-28 18:40:53,178 [INFO]   prompt 1/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=2.351  max_d_mean=nan
-2026-08-28 18:48:41,081 [INFO]   prompt 2/100  seq_len=139 n_valid=122  467s  max||J||/sqrt(d)=2.425  max_d_mean=2.53e-01
-2026-08-28 18:56:30,036 [INFO]   prompt 3/100  seq_len=139 n_valid=122  466s  max||J||/sqrt(d)=2.525  max_d_mean=2.09e-01
-2026-08-28 19:04:20,180 [INFO]   prompt 4/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=3.012  max_d_mean=1.99e-01
-2026-08-28 19:12:10,409 [INFO]   prompt 5/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=3.414  max_d_mean=1.94e-01
-2026-08-28 19:20:00,840 [INFO]   prompt 6/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=2.987  max_d_mean=9.20e-02
-2026-08-28 19:27:51,346 [INFO]   prompt 7/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=2.407  max_d_mean=7.70e-02
-2026-08-28 19:35:41,874 [INFO]   prompt 8/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=2.394  max_d_mean=6.70e-02
-2026-08-28 19:43:32,330 [INFO]   prompt 9/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=2.450  max_d_mean=4.84e-02
-2026-08-28 19:51:22,850 [INFO]   prompt 10/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=2.532  max_d_mean=6.13e-02
-2026-08-28 19:59:13,178 [INFO]   prompt 11/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=2.511  max_d_mean=4.89e-02
-2026-08-28 20:07:03,570 [INFO]   prompt 12/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=2.532  max_d_mean=4.04e-02
-2026-08-28 20:14:53,996 [INFO]   prompt 13/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=2.464  max_d_mean=3.27e-02
-2026-08-28 20:22:44,898 [INFO]   prompt 14/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=2.816  max_d_mean=4.00e-02
-2026-08-28 20:30:35,589 [INFO]   prompt 15/100  seq_len=139 n_valid=122  468s  max||J||/sqrt(d)=2.403  max_d_mean=3.25e-02
-2026-08-28 20:38:24,863 [INFO]   prompt 16/100  seq_len=139 n_valid=122  467s  max||J||/sqrt(d)=2.787  max_d_mean=3.44e-02
-2026-08-28 20:46:13,935 [INFO]   prompt 17/100  seq_len=139 n_valid=122  466s  max||J||/sqrt(d)=2.492  max_d_mean=2.96e-02
-2026-08-28 20:54:03,129 [INFO]   prompt 18/100  seq_len=139 n_valid=122  467s  max||J||/sqrt(d)=2.580  max_d_mean=2.52e-02
-2026-08-28 21:01:52,279 [INFO]   prompt 19/100  seq_len=139 n_valid=122  467s  max||J||/sqrt(d)=2.467  max_d_mean=2.69e-02
-2026-08-28 21:09:41,459 [INFO]   prompt 20/100  seq_len=139 n_valid=122  467s  max||J||/sqrt(d)=2.457  max_d_mean=2.41e-02
-2026-08-28 21:17:30,573 [INFO]   prompt 21/100  seq_len=139 n_valid=122  467s  max||J||/sqrt(d)=2.527  max_d_mean=2.48e-02
-2026-08-28 21:25:19,810 [INFO]   prompt 22/100  seq_len=139 n_valid=122  467s  max||J||/sqrt(d)=2.428  max_d_mean=1.88e-02
