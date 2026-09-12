@@ -9,6 +9,21 @@ class Parser:
     def __init__(self):
         pass
 
+    def load_jsonl_lines(path: str) -> list[str]:
+        """
+        * Accepts the absolute path to the audio.
+        * Parses the jsonl file into lines.
+        """
+        if not os.path.isfile(path):
+            raise RuntimeError(f"Json file does not exist({path})")
+        lines = []
+        with open(path, "r", encoding="utf-8") as f:
+            for raw in f:
+                raw = raw.strip()
+                if raw:
+                    lines.append(raw)
+        return lines
+
     def parse_prompt(self, json_line: str, max_prompt_size: int = 40) -> tuple[str, str, str]:
         """
         * The protocol of the multimodal prompt is as follows:
@@ -41,6 +56,9 @@ class Parser:
         return id, audio_rel_path, safe_text
 
     def load_audio(self, sample_id: int, audio_path: str, sampling_rate: int):
+        """
+        * Accepts the absolute path to the audio.
+        """
         if not os.path.isfile(audio_path):
             raise FileNotFoundError(f"樣本 {sample_id} 的音檔不存在：{audio_path}")
         audio_array, _ = librosa.load(audio_path, sr= sampling_rate)

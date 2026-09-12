@@ -47,11 +47,13 @@ class Jlens(l.Lens):
         * Or, simply replace the original if replace = True is specified.
         * WARNING: No duplicate protection when full path is specified!!!
         """
+        import parser
+        parser = parser.Parser()
     
-        jsonl_path = os.path.join(data_path, jsonl_name)
+        jsonl_path = os.path.abspath(os.path.join(data_path, jsonl_name))
         lens_model = self._ensure_instance(data_path)
         logger.info("Loading metadata from %s", jsonl_path)
-        records = load_jsonl_lines(jsonl_path)
+        records = parser.load_jsonl_lines(jsonl_path)
         logger.info("Loaded %d samples", len(records))
     
         logger.info("Filtering samples by length (max_seq_len=%d) before fitting...", MAX_SEQ_LEN)
@@ -150,7 +152,10 @@ class Jlens(l.Lens):
         
         run_layers = []
         if layers_available is None:
-            run_layers = list(range(self.model.n_layers))
+            if do_activate_Jacobian:
+                run_layers = list(range(self.model.n_layers - 1))
+            else:
+                run_layers = list(range(self.model.n_layers))
         else:
             run_layers = layers_available
         
@@ -249,12 +254,3 @@ def filter_by_length(records, processor, data_root: str, sampling_rate: int, max
         f"，捨棄: {dropped}" if dropped else "",
     )
     return kept
-
-def load_jsonl_lines(path: str):
-    lines = []
-    with open(path, "r", encoding="utf-8") as f:
-        for raw in f:
-            raw = raw.strip()
-            if raw:
-                lines.append(raw)
-    return lines

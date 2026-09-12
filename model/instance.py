@@ -1,12 +1,11 @@
 import Jlens_Qwen_new.parser as J
-import jlens.protocol as prot
 import json, os, logging
 import librosa, torch
 
 logger = logging.getLogger(__name__)
 
 
-class Instance(prot.LensModel):
+class Instance():
     """
     Qwen2-Audio 的 adapter，給 JLens 使用。
     職責：
@@ -19,24 +18,29 @@ class Instance(prot.LensModel):
     forward() 裡的 .expand(dim_batch, ...) 是把「同一個音檔」複製到
     整個 batch，不是處理多個不同音檔。
     """
-    def __init__(self, model, processor, data_root: str,
-                 device: str = "cuda", model_dtype: torch.dtype = torch.bfloat16 ):
-        # Variable from Anthropic's protocol
-        self.n_layers = lm_config.num_hidden_layers
-        self.d_model = lm_config.hidden_size
-        self.layers = self.LALM_model.language_model.layers
-        self.tokenizer = processor.tokenizer
+    def __init__(self, model, processor, data_root: str):
+        if not data_root:
+            raise ValueError("data_root 不能是空字串")
+        self.data_root = os.path.abspath(os.path.expanduser(data_root))
 
         self.hf_model = model
         self.LALM_model = getattr(model, "model", model)
 
         self.processor = processor
         self.sampling_rate = processor.feature_extractor.sampling_rate
-        self.data_root = os.path.expanduser(data_root)
-        self.device = device
-        self.hf_model_dtype = model_dtype
+        self.device = self.LALM_model.get_input_embeddings().weight.device
+        self.hf_model_dtype = self.LALM_model.get_input_embeddings().weight.dtype
 
         lm_config = self.LALM_model.language_model.config
+        self.cached_audio_features = None
+
+        # Variable from Anthropic's protocol
+        self.n_layers = lm_config.num_hidden_layers
+        self.d_model = lm_config.hidden_size
+        self.layers = self.LALM_model.language_model.layers
+        self.tokenizer = processor.tokenizer
+        
+    def clear_audio_cache(self):
         self.cached_audio_features = None
 
     # ------------------------------------------------------------------
@@ -48,6 +52,7 @@ class Instance(prot.LensModel):
         * Calls the processor to encode the audio files.
         * Returns the tokenized Audio + text prompt
         """
+        self.clear_audio_cache()
         parser = J.Parser()
 
         sample_id, audio_rel_path, text_prompt = parser.parse_prompt(json_line)
@@ -79,11 +84,18 @@ class Instance(prot.LensModel):
         )
         return input_ids
 
+    #TODO Chat template NOT implemented! The current version relies on simple text prompt!
     def forward(self, input_ids: torch.Tensor) -> torch.Tensor:
         """
         * Runs the residual stack.
         * Returns the last hidden states.
         """
+        if input_ids.ndim != 2:
+            raise ValueError(
+                f"input_ids 預期為 [batch, seq_len]，"
+                f"實際 shape={tuple(input_ids.shape)}"
+            )
+
         if self.cached_audio_features is None:
             raise RuntimeError(
                 "forward() 被呼叫前必須先呼叫 encode()，"
@@ -115,14 +127,15 @@ class Instance(prot.LensModel):
         * Maps the residual stream into logits.
         """
         target_dtype = self.LALM_model.language_model.norm.weight.dtype
-        residual = residual.to(device=self.device, dtype=target_dtype)
+        norm_device = self.LALM_model.language_model.norm.weight.device
+        residual = residual.to(device=norm_device, dtype=target_dtype)
         normed = self.LALM_model.language_model.norm(residual)
         return self.hf_model.lm_head(normed)
 
     # ------------------------------------------------------------------
     # 音訊特徵快取
     # ------------------------------------------------------------------
-    def _compute_audio_features_once(self, input_ids_batch1: torch.Tensor,
+    def compute_audio_features_once(self, input_ids_batch1: torch.Tensor,
         input_features: torch.Tensor, feature_attention_mask: torch.Tensor ):
         """
         以 batch=1、no_grad 跑一次完整 forward，用 forward hook 攔截
@@ -155,3 +168,21 @@ class Instance(prot.LensModel):
             )
 
         self.cached_audio_features = captured["audio_features"].detach()
+
+        if self.cached_audio_features.ndim != 3:
+            raise ValueError(
+                f"audio_features 預期為 [batch, tokens, d_model]，"
+                f"實際 shape={tuple(self.cached_audio_features.shape)}"
+            )
+
+        if self.cached_audio_features.shape[0] != 1:
+            raise ValueError(
+                f"Instance 目前只支援 batch=1 音訊，"
+                f"實際 batch={self.cached_audio_features.shape[0]}"
+            )
+
+        if self.cached_audio_features.shape[-1] != self.d_model:
+            raise ValueError(
+                f"audio feature hidden size={self.cached_audio_features.shape[-1]}，"
+                f"預期 d_model={self.d_model}"
+            )
