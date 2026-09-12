@@ -3,17 +3,38 @@ from jlens.lens import JacobianLens
 from loguru import logger
 import sys, os, json, librosa
 import lens as l
+from model.instance import Instance
 
 #TODO seperate json and audio loading from this class
 
 class Jlens(l.Lens):
+    """
+    Master class of all Jlens related methods.
+    """
     def __init__(self, model = None, processor = None):
         super().__init__()
         if model is None: raise ValueError("No model passed to Jlens.")
         if processor is None: raise ValueError("No processor passed to Jlens.")
-        self.model = model # Jlens only apply to a single model, this is safer
+        self.hf_model = model
         self.processor = processor
+        self.model: Instance | None = None
+        self.data_root = None
         self.lens = None
+
+    def _ensure_instance(self, data_root: str):
+        if not data_root:
+            raise ValueError("No data root passed to Jlens.")
+
+        normalized_root = os.path.abspath(os.path.expanduser(data_root))
+        if self.model is None or self.data_root != normalized_root:
+            self.model = Instance(
+                model=self.hf_model,
+                processor=self.processor,
+                data_root=normalized_root,
+            )
+            self.data_root = normalized_root
+
+        return self.model
 
     def calc_lens(self, data_path: str, jsonl_name: str, model_name: str, do_replace: bool = False,
                   checkpoint_path: str | None = None, run_name: str | None = None, dim_batch: int = 32,
@@ -28,6 +49,7 @@ class Jlens(l.Lens):
         """
     
         jsonl_path = os.path.join(data_path, jsonl_name)
+        lens_model = self._ensure_instance(data_path)
         logger.info("Loading metadata from %s", jsonl_path)
         records = load_jsonl_lines(jsonl_path)
         logger.info("Loaded %d samples", len(records))
@@ -43,7 +65,7 @@ class Jlens(l.Lens):
         if not records:
             raise ValueError("長度過濾後沒有剩下任何樣本，請檢查 max_seq_len 設定或資料本身。Exiting...")
     
-        n_layers = self.model.n_layers  # 應為 32
+        n_layers = lens_model.n_layers  # 應為 32
         source_layers = list(range(n_layers - 1))  # 0..30，共 31 層
         target_layer = n_layers - 1  # 31
     
@@ -57,7 +79,7 @@ class Jlens(l.Lens):
         )
     
         self.lens = jlens_fit(
-            model=self.model,
+            model=lens_model,
             prompts=records,
             source_layers=source_layers,
             target_layer=target_layer,
@@ -103,7 +125,14 @@ class Jlens(l.Lens):
         self.save_lens(path = save_dir)
 
     #TODO: This is Qwen-specific. Has to be changed to work for more models.
-    def apply(self, do_activate_Jacobian: bool = True, json_line: str | None = None, layers_available: list[int] | None = None, MAX_SEQ_LEN: int = 300):
+    def apply(
+        self,
+        do_activate_Jacobian: bool = True,
+        json_line: str | None = None,
+        layers_available: list[int] | None = None,
+        MAX_SEQ_LEN: int = 300,
+        data_root: str | None = None,
+    ):
         """
         * Applying Lens to model. To use LogitLens, use do_activate_Jacobian = False
         * json_line takes raw json data.
@@ -111,10 +140,17 @@ class Jlens(l.Lens):
         """
         if self.lens is None:
             raise RuntimeError("Jlens not yet calculated, please call calc_lens() before applying.")
+        if data_root is not None:
+            self._ensure_instance(data_root)
+        if self.model is None:
+            raise RuntimeError(
+                "No data root is configured for the multimodal model. "
+                "Pass data_root to apply() or call calc_lens() first."
+            )
         
         run_layers = []
         if layers_available is None:
-            run_layers = list(range(self.model.model.language_model.config.num_hidden_layers))
+            run_layers = list(range(self.model.n_layers))
         else:
             run_layers = layers_available
         

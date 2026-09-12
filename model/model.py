@@ -5,21 +5,22 @@ from loguru import logger
 import os, sys, time, torch, librosa, soundfile
 
 class Model:
-    def __init__(self, lens_path: str = None, do_4bit: bool = False, 
-                 MODEL_ID="Qwen/Qwen2-Audio-7B-Instruct"):
+    def __init__(self, do_4bit: bool = False, MODEL_ID="Qwen/Qwen2-Audio-7B-Instruct"):
         self.model_id = MODEL_ID
         self.do_4bit = do_4bit
+        self.lens = L.LogitLens()
         """
+        Master class of all model methods.
         Automatically loads the model.
-        lens_path: Default None, automatically apply LogitLens. Auto-switch to Jlens after calc_lens() is called.
+        LogitLens is the default. To load Jlens, use load_lens(), and to calculate Jlens, use calc_Jlens().
         """
         if do_4bit:
             try:
                 self.model, self.processor = load_model_4bit(MODEL_ID)
                 print("Loading model using 4bit")
             except Exception as e:
-                print("Failed Loading model({e}). Exiting...")
-                exit(1)
+                raise RuntimeError("Failed Loading model({e}). Exiting...")
+                
         else:
             try:
                 self.model = Qwen2AudioForConditionalGeneration.from_pretrained(
@@ -29,32 +30,55 @@ class Model:
                 )
                 self.processor = AutoProcessor.from_pretrained(MODEL_ID)
             except Exception as e:
-                print("Failed Loading model({e}). Exiting...")
-                exit(1)
+                raise RuntimeError("Failed Loading model({e}). Exiting...")
 
         self.model.eval()
-        for p in full_model.parameters():
+        for p in self.model.parameters():
             p.requires_grad_(False)
-        n_requires_grad = sum(p.requires_grad for p in full_model.parameters())
+        n_requires_grad = sum(p.requires_grad for p in self.model.parameters())
         logger.info("requires_grad=True 參數數量: %d（預期為 0）", n_requires_grad)
         assert n_requires_grad == 0
-
-        if lens_path is None:
-            self.lens = L.LogitLens(self.model)
-        else:
-            self.lens = J.Jlens(self.model)
 
     def get_model(self):
         return self.model, self.processor
 
     def test_model(self, audio_path: str = "test_audio.wav"):
+        #TODO Add a default testing audio path!
+        if not os.path.isfile(audio_path):
+            raise RuntimeError("Audio path does not exist.")
         run_inference_smoke_test(self.model, self.processor, audio_path)
 
-    def load_lens(self, lens_path: str):
+    def load_lens(self, lens_path: str | None = None, name: str | None = None):
+        self.lens = J.Jlens(self.model, self.processor)
+        self.lens.load_lens(path = lens_path, name = name)
+
+    def calc_Jlens(self, jsonl_path: str, dim_batch: int | None = None,
+                   checkpoint_interval: int | None = None, MAX_SEQ_LEN: int | None = None,
+                   do_replace: bool = False, checkpoint_save_path: str | None = None,
+                   run_name: str | None = None):
+        """
+        * Calls the calc_lens() function in Jlens.
+        * See ~/Jlens/Jlens.py for detail.
+        * jsonl_path accepts the relative path to jsonl files.
+        """
+        # Parse the jsonl_path into data path(parent directory) and jsonl name
+        if not os.path.isfile(jsonl_path):
+            raise RuntimeError(f"Jsonl file({jsonl_path}) does not exist.")
+        parent_dir, jsonl_name = os.path.split(jsonl_path)
+
+        self.lens = J.Jlens(self.model, self.processor)
+        self.lens.calc_lens(self, data_path= parent_dir, jsonl_name= jsonl_name, model_name= self.model_id, do_replace= do_replace, 
+                            checkpoint_path= checkpoint_save_path, run_name= run_name, dim_batch= dim_batch,
+                            MAX_SEQ_LEN= MAX_SEQ_LEN, checkpoint_every= checkpoint_interval)
+
+    def encode_audio(self, audio_path: str):
         pass
 
-    def run(self, audio, sampling_rate: int):
-        instance = Inst.Instance(self.model, self.processor, audio, sampling_rate)
+    def apply_lens(self, audio_path):
+        instance = Inst.Instance(self.model, self.processor)
+        pass
+
+    def run_inference(self):
         pass
 
 def load_model_4bit(MODEL_ID: str):
