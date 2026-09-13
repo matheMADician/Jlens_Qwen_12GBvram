@@ -9,7 +9,7 @@ class Parser:
     def __init__(self):
         pass
 
-    def load_jsonl_lines(path: str) -> list[str]:
+    def load_jsonl_lines(self, path: str) -> list[str]:
         """
         * Accepts the absolute path to the audio.
         * Parses the jsonl file into lines.

@@ -1,6 +1,5 @@
 from Jlens import lens, Jlens as J, LogitLens as L
 from model import instance as Inst
-from loguru import logger
 import os, sys, time, torch, librosa, soundfile
 
 class Model:
