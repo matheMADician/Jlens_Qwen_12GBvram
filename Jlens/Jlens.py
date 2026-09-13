@@ -11,63 +11,52 @@ class Jlens(l.Lens):
     """
     Master class of all Jlens related methods.
     """
-    def __init__(self, model = None, processor = None):
+    def __init__(self, model: Instance | None = None):
         super().__init__()
         if model is None: raise ValueError("No model passed to Jlens.")
-        if processor is None: raise ValueError("No processor passed to Jlens.")
-        self.hf_model = model
-        self.processor = processor
-        self.model: Instance | None = None
-        self.data_root = None
+        if not isinstance(model, Instance):
+            raise TypeError("Jlens requires an initialized Instance.")
+        
+        self.model = model
         self.lens = None
 
-    def _ensure_instance(self, data_root: str):
+    def _load_data(self, data_root: str):
         if not data_root:
             raise ValueError("No data root passed to Jlens.")
+        self.model.load_data(data_root)
 
-        normalized_root = os.path.abspath(os.path.expanduser(data_root))
-        if self.model is None or self.data_root != normalized_root:
-            self.model = Instance(
-                model=self.hf_model,
-                processor=self.processor,
-                data_root=normalized_root,
-            )
-            self.data_root = normalized_root
-
-        return self.model
-
-    def calc_lens(self, data_path: str, jsonl_name: str, model_name: str, do_replace: bool = False,
-                  checkpoint_path: str | None = None, run_name: str | None = None, dim_batch: int = 32,
-                  MAX_SEQ_LEN: int = 300, checkpoint_every: int = 5):
+    def calc_lens(self, data_path: str, jsonl_name: str, do_replace: bool = False,
+                  checkpoint_path: str | None = None, run_name: str | None = None,
+                  dim_batch: int = 32, MAX_SEQ_LEN: int = 300, checkpoint_every: int = 5):
         """
         * Calculates Jlens for the specified model using data in the given data_path.
         * If run_name is specified, the function ignores the path and looks for it in ~/Jlens/lens_checkpoints/*name*
         * If a checkpoint named *run_name* is already in there, automatically try run_name_1 or more.
         * If more than 10 is present, it'll be named as *run_name*_1919810😢.
-        * Or, simply replace the original if replace = True is specified.
+        * Replaces the original if replace = True is specified.
         * WARNING: No duplicate protection when full path is specified!!!
         """
         import parser
         parser = parser.Parser()
     
         jsonl_path = os.path.abspath(os.path.join(data_path, jsonl_name))
-        lens_model = self._ensure_instance(data_path)
+        self._load_data(data_path)
         logger.info("Loading metadata from %s", jsonl_path)
         records = parser.load_jsonl_lines(jsonl_path)
         logger.info("Loaded %d samples", len(records))
     
         logger.info("Filtering samples by length (max_seq_len=%d) before fitting...", MAX_SEQ_LEN)
-        records = filter_by_length(
+        records = process_audio(
             records,
-            processor=self.processor,
+            processor=self.model.processor,
             data_root=data_path,
-            sampling_rate=self.processor.feature_extractor.sampling_rate,
+            sampling_rate=self.model.sampling_rate,
             max_length=MAX_SEQ_LEN,
         )
         if not records:
             raise ValueError("長度過濾後沒有剩下任何樣本，請檢查 max_seq_len 設定或資料本身。Exiting...")
     
-        n_layers = lens_model.n_layers  # 應為 32
+        n_layers = self.model.n_layers  # 應為 32
         source_layers = list(range(n_layers - 1))  # 0..30，共 31 層
         target_layer = n_layers - 1  # 31
     
@@ -81,7 +70,7 @@ class Jlens(l.Lens):
         )
     
         self.lens = jlens_fit(
-            model=lens_model,
+            model=self.model,
             prompts=records,
             source_layers=source_layers,
             target_layer=target_layer,
@@ -127,32 +116,24 @@ class Jlens(l.Lens):
         self.save_lens(path = save_dir)
 
     #TODO: This is Qwen-specific. Has to be changed to work for more models.
-    def apply(
-        self,
-        do_activate_Jacobian: bool = True,
-        json_line: str | None = None,
-        layers_available: list[int] | None = None,
-        MAX_SEQ_LEN: int = 300,
-        data_root: str | None = None,
-    ):
+    def apply_lens( self, do_activate_Jacobian: bool = True,
+        json_line: str | None = None, layers_available: list[int] | None = None,
+        MAX_SEQ_LEN: int = 300, data_root: str | None = None ):
         """
-        * Applying Lens to model. To use LogitLens, use do_activate_Jacobian = False
+        * Applies Lens to model. To use LogitLens, use do_activate_Jacobian = False
         * json_line takes raw json data.
         * Returns in order: lens_logits, model_logits, input_ids
         """
         if self.lens is None:
             raise RuntimeError("Jlens not yet calculated, please call calc_lens() before applying.")
         if data_root is not None:
-            self._ensure_instance(data_root)
-        if self.model is None:
-            raise RuntimeError(
-                "No data root is configured for the multimodal model. "
-                "Pass data_root to apply() or call calc_lens() first."
-            )
-        
+            self._load_data(data_root)
+
         run_layers = []
         if layers_available is None:
             if do_activate_Jacobian:
+                #? Does Anthropic's code accept the last layer in Jlens functions? Needs investigation.
+                #  If not, just use Logitlens instead.
                 run_layers = list(range(self.model.n_layers - 1))
             else:
                 run_layers = list(range(self.model.n_layers))
@@ -211,8 +192,12 @@ class Jlens(l.Lens):
         except Exception as e:
             raise RuntimeError(f"Failed loading lens from {checkpoint_path}({e}).")
 
-
-def filter_by_length(records, processor, data_root: str, sampling_rate: int, max_length: int):
+# TODO: Decide on a default value for max_length! Require testing on a physical device.
+def process_audio(records, processor, data_root: str, sampling_rate: int, max_length: int):
+    """
+    * Processes the audio.
+    * Filters all samples with length(after encoding) longer than max_length
+    """
     kept, dropped = [], []
     for line in records:
         record = json.loads(line)

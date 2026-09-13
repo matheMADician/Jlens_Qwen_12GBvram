@@ -1,6 +1,7 @@
 import Jlens_Qwen_new.parser as J
-import json, os, logging
+import json, os, logging, time
 import librosa, torch
+from transformers import Qwen2AudioForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
 
 logger = logging.getLogger(__name__)
 
@@ -18,30 +19,50 @@ class Instance():
     forward() 裡的 .expand(dim_batch, ...) 是把「同一個音檔」複製到
     整個 batch，不是處理多個不同音檔。
     """
-    def __init__(self, model, processor, data_root: str):
-        if not data_root:
-            raise ValueError("data_root 不能是空字串")
-        self.data_root = os.path.abspath(os.path.expanduser(data_root))
+    def __init__(self, MODEL_ID: str, do_4bit: bool = False ):
+        # Root directory of data. Jlens methods rely on the absolute path, while the
+        # input json uses relative path
+        self.data_root = None
 
-        self.hf_model = model
-        self.LALM_model = getattr(model, "model", model)
+        # Load Model
+        self.hf_model, self.processor = load_model(MODEL_ID= MODEL_ID, do_4bit= do_4bit)
+        self.LALM_model = getattr(self.hf_model, "model", self.hf_model)
 
-        self.processor = processor
-        self.sampling_rate = processor.feature_extractor.sampling_rate
+        # Model parameters
+        self.sampling_rate = self.processor.feature_extractor.sampling_rate
         self.device = self.LALM_model.get_input_embeddings().weight.device
         self.hf_model_dtype = self.LALM_model.get_input_embeddings().weight.dtype
-
         lm_config = self.LALM_model.language_model.config
-        self.cached_audio_features = None
 
-        # Variable from Anthropic's protocol
+        # Audio feature cache
+        self.cached_audio_features = None
+        
+        # Variable for Anthropic's protocol
         self.n_layers = lm_config.num_hidden_layers
         self.d_model = lm_config.hidden_size
         self.layers = self.LALM_model.language_model.layers
-        self.tokenizer = processor.tokenizer
+        self.tokenizer = self.processor.tokenizer
         
     def clear_audio_cache(self):
         self.cached_audio_features = None
+
+    def get_model(self):
+        return self.hf_model, self.processor
+
+    def get_model_info(self):
+        pass
+
+    def load_data(self, data_root: str):
+        """
+        * Accepts relative path to data_root.
+        """
+        if not data_root:
+            raise ValueError("data_root 不能是空字串")
+        self.data_root = os.path.abspath(os.path.expanduser(data_root))
+        if not os.path.isdir(self.data_root):
+            raise FileNotFoundError(
+                f"資料根目錄不存在：{self.data_root}"
+            )
 
     # ------------------------------------------------------------------
     # JLens 介面：encode / forward / unembed
@@ -50,12 +71,16 @@ class Instance():
         """
         * Loads one line from the jsonl file, and parse all the audio.
         * Calls the processor to encode the audio files.
-        * Returns the tokenized Audio + text prompt
+        * Returns the tokenized (Audio + text prompt)
         """
+        if self.data_root is None:
+            raise RuntimeError("No data root directory specified. Please call load_data() first.")
+
         self.clear_audio_cache()
         parser = J.Parser()
 
         sample_id, audio_rel_path, text_prompt = parser.parse_prompt(json_line)
+
         audio_path = os.path.join(self.data_root, audio_rel_path)
         audio_array = parser.load_audio(sample_id= sample_id,
             audio_path= audio_path, sampling_rate= self.sampling_rate)
@@ -186,3 +211,70 @@ class Instance():
                 f"audio feature hidden size={self.cached_audio_features.shape[-1]}，"
                 f"預期 d_model={self.d_model}"
             )
+
+def load_model(MODEL_ID: str, do_4bit: bool = False):
+    if do_4bit:
+        try:
+            hf_model, processor = load_model_4bit(MODEL_ID)
+            print("Loading model using 4bit")
+        except Exception as e:
+            raise RuntimeError("Failed Loading model({e}). Exiting...")
+            
+    else:
+        try:
+            hf_model = Qwen2AudioForConditionalGeneration.from_pretrained(
+                MODEL_ID,
+                torch_dtype=torch.bfloat16,
+                device_map={"": 0},
+            )
+            processor = AutoProcessor.from_pretrained(MODEL_ID)
+        except Exception as e:
+            raise RuntimeError("Failed Loading model({e}). Exiting...")
+
+    hf_model.eval()
+    for p in hf_model.parameters():
+        p.requires_grad_(False)
+    n_requires_grad = sum(p.requires_grad for p in hf_model.parameters())
+    logger.info("requires_grad=True 參數數量: %d（預期為 0）", n_requires_grad)
+    assert n_requires_grad == 0
+
+    return hf_model, processor
+
+def load_model_4bit(MODEL_ID: str):
+    print("=" * 70)
+    print("[Step 2] 以 4-bit (NF4) 量化載入 Qwen2-Audio-7B-Instruct")
+    print("=" * 70)
+
+    bnb_config = BitsAndBytesConfig(
+        load_in_4bit=True,
+        bnb_4bit_quant_type="nf4",
+        bnb_4bit_compute_dtype=torch.bfloat16,
+        bnb_4bit_use_double_quant=True,
+    )
+
+    torch.cuda.reset_peak_memory_stats()
+    t0 = time.time()
+
+    processor = AutoProcessor.from_pretrained(MODEL_ID)
+
+    # attn_implementation="flash_attention_2" 可選用（需另外安裝 flash-attn，
+    # RTX 3060 屬 Ampere 架構相容）；若未安裝則保留預設 "sdpa" 即可。
+
+    #TODO: 加入相容其他模型的選項
+    hf_model = Qwen2AudioForConditionalGeneration.from_pretrained(
+        MODEL_ID,
+        quantization_config=bnb_config,
+        device_map="auto",
+        torch_dtype=torch.bfloat16,
+    )
+    hf_model.eval()
+
+    load_time = time.time() - t0
+    vram_after_load = torch.cuda.max_memory_allocated() / (1024 ** 3)
+    print(f"  模型載入完成，耗時 {load_time:.1f}s")
+    print(f"  載入後 VRAM 峰值: {vram_after_load:.2f} GB")
+    print()
+
+    return hf_model, processor
+
+        
