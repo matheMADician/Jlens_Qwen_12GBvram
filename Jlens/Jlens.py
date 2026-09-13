@@ -2,7 +2,7 @@ from jlens.fitting import fit as jlens_fit
 from jlens.lens import JacobianLens
 from loguru import logger
 import sys, os, json, librosa
-import lens as l
+from Jlens import lens as l
 from model.instance import Instance
 
 #TODO seperate json and audio loading from this class

@@ -1,5 +1,7 @@
-from logging import logger
+from logging import getLogger
 import os, json, librosa
+
+logger = getLogger(__name__)
 
 class Parser:
     """

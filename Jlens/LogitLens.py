@@ -1,4 +1,4 @@
-import lens as l
+from Jlens import lens as l
 class LogitLens(l.Lens):
     def __init__(self, model = None, processor = None):
         super().__init__()

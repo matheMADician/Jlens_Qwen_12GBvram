@@ -1,4 +1,4 @@
-import Jlens_Qwen_new.parser as J
+import parser as J
 import json, os, logging, time
 import librosa, torch
 from transformers import Qwen2AudioForConditionalGeneration, AutoProcessor, BitsAndBytesConfig
