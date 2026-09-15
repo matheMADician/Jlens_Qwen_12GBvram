@@ -1,7 +1,4 @@
-from logging import getLogger
 import os, json, librosa
-
-logger = getLogger(__name__)
 
 class Parser:
     """
@@ -26,7 +23,7 @@ class Parser:
                     lines.append(raw)
         return lines
 
-    def parse_prompt(self, json_line: str, max_prompt_size: int = 40) -> tuple[str, str, str]:
+    def parse_json_line(self, json_line: str, max_prompt_size: int = 40) -> tuple[str, str, str]:
         """
         * The protocol of the multimodal prompt is as follows:
         {
@@ -47,6 +44,7 @@ class Parser:
             raise ValueError(f"樣本 {id} 缺少 audio_path 或 prompt 欄位")
 
         safe_text = text_prompt.replace("\n", "\\n")
+        """
         if len(safe_text) > max_prompt_size:
             from math import floor
             retain_token_num = floor(max_prompt_size / 2)
@@ -54,6 +52,7 @@ class Parser:
         else:
             display_text = f"<{safe_text}>"
         logger.info("📥 載入樣本 [%s]: %s", id, display_text)
+        """
 
         return id, audio_rel_path, safe_text
 

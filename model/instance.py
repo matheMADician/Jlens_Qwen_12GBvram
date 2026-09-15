@@ -1,3 +1,4 @@
+from jacobian_lens.jlens.protocol import LensModel
 import parser as J
 import json, os, logging, time
 import librosa, torch
@@ -6,7 +7,7 @@ from transformers import Qwen2AudioForConditionalGeneration, AutoProcessor, Bits
 logger = logging.getLogger(__name__)
 
 
-class Instance():
+class Instance(LensModel):
     """
     Qwen2-Audio 的 adapter，給 JLens 使用。
     職責：
@@ -67,7 +68,7 @@ class Instance():
     # ------------------------------------------------------------------
     # JLens 介面：encode / forward / unembed
     # ------------------------------------------------------------------
-    def encode(self, json_line: str, *, max_length: int = 300) -> torch.Tensor:
+    def encode(self, text: str, *, max_length: int = 300) -> torch.Tensor:
         """
         * Loads one line from the jsonl file, and parse all the audio.
         * Calls the processor to encode the audio files.
@@ -79,8 +80,11 @@ class Instance():
         self.clear_audio_cache()
         parser = J.Parser()
 
-        sample_id, audio_rel_path, text_prompt = parser.parse_prompt(json_line)
-
+        sample_id, audio_rel_path, text_prompt = parser.parse_json_line(text)
+        if not sample_id.isdecimal():
+            raise ValueError(f"Sample id must be decimal({sample_id})")
+        sample_id = int(sample_id)
+        
         audio_path = os.path.join(self.data_root, audio_rel_path)
         audio_array = parser.load_audio(sample_id= sample_id,
             audio_path= audio_path, sampling_rate= self.sampling_rate)

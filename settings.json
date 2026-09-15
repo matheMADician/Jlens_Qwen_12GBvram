@@ -1,4 +1,5 @@
 {
+    "do_4bit": false,
     "Model_ID": "Qwen/Qwen2-Audio-7B-Instruct",
     "Jlens_Max_Seq_Len": 300
 }

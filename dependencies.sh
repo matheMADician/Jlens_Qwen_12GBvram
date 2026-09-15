@@ -30,7 +30,7 @@ TORCH_VERSION="2.5.1"
 CUDA_TAG="cu121"
 TRANSFORMERS_REPO="git+https://github.com/huggingface/transformers"
 JLENS_REPO="https://github.com/anthropics/jacobian-lens"
-JLENS_DIR="${JLENS_DIR:-./jacobian-lens}"
+JLENS_DIR="${JLENS_DIR:-./jacobian_lens}"
 
 # 顏色輸出
 RED='\033[0;31m'

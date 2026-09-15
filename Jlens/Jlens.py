@@ -1,7 +1,6 @@
-from jlens.fitting import fit as jlens_fit
-from jlens.lens import JacobianLens
-from loguru import logger
-import sys, os, json, librosa
+from jacobian_lens.jlens.fitting import fit as jlens_fit
+from jacobian_lens.jlens.lens import JacobianLens
+import os, json, librosa, logging
 from Jlens import lens as l
 from model.instance import Instance
 
@@ -11,7 +10,7 @@ class Jlens(l.Lens):
     """
     Master class of all Jlens related methods.
     """
-    def __init__(self, model: Instance | None = None):
+    def __init__(self, logger: logging.Logger, model: Instance | None = None):
         super().__init__()
         if model is None: raise ValueError("No model passed to Jlens.")
         if not isinstance(model, Instance):
@@ -19,6 +18,7 @@ class Jlens(l.Lens):
         
         self.model = model
         self.lens = None
+        self.logger = logger
 
     def _load_data(self, data_root: str):
         if not data_root:
@@ -41,13 +41,14 @@ class Jlens(l.Lens):
     
         jsonl_path = os.path.abspath(os.path.join(data_path, jsonl_name))
         self._load_data(data_path)
-        logger.info("Loading metadata from %s", jsonl_path)
+        self.logger.info("Loading metadata from %s", jsonl_path)
         records = parser.load_jsonl_lines(jsonl_path)
-        logger.info("Loaded %d samples", len(records))
+        self.logger.info("Loaded %d samples", len(records))
     
-        logger.info("Filtering samples by length (max_seq_len=%d) before fitting...", MAX_SEQ_LEN)
+        self.logger.info("Filtering samples by length (max_seq_len=%d) before fitting...", MAX_SEQ_LEN)
         records = process_audio(
-            records,
+            records = records,
+            logger = self.logger,
             processor=self.model.processor,
             data_root=data_path,
             sampling_rate=self.model.sampling_rate,
@@ -60,11 +61,11 @@ class Jlens(l.Lens):
         source_layers = list(range(n_layers - 1))  # 0..30，共 31 層
         target_layer = n_layers - 1  # 31
     
-        logger.info(
+        self.logger.info(
             "Fitting all %d layers together: source_layers=%s..%s, target_layer=%s",
             n_layers, source_layers[0], source_layers[-1], target_layer,
         )
-        logger.info(
+        self.logger.info(
             "dim_batch=%d, max_seq_len=%d, checkpoint_every=%d, checkpoint_path=%s",
             dim_batch, MAX_SEQ_LEN, checkpoint_every, checkpoint_path,
         )
@@ -80,8 +81,8 @@ class Jlens(l.Lens):
             checkpoint_every=checkpoint_every,
         )
     
-        logger.info("fitting finished. %r", self.lens)
-        logger.info("Saving lens...")
+        self.logger.info("fitting finished. %r", self.lens)
+        self.logger.info("Saving lens...")
 
         save_dir = ""
         if run_name is not None:
@@ -91,12 +92,12 @@ class Jlens(l.Lens):
                 save_success = False
                 for i in range(10):
                     if not os.path.exists(os.path.join(save_directory_dir, run_name + f"_{i}")):
-                        logger.warning(f"File {save_dir} already exists. Saving as {run_name}_{i}")
+                        self.logger.warning(f"File {save_dir} already exists. Saving as {run_name}_{i}")
                         save_dir = os.path.join(save_directory_dir, run_name + f"_{i}")
                         save_success = True
                         break
                 if not save_success:
-                    logger.error(f"File {save_dir} have 10+ checkpoint with the same name. Check your code 😭.")
+                    self.logger.error(f"File {save_dir} have 10+ checkpoint with the same name. Check your code 😭.")
                     save_dir = os.path.join(save_directory_dir, run_name + f"_{1919810}")
         elif checkpoint_path is not None:
             save_dir = checkpoint_path  
@@ -106,7 +107,7 @@ class Jlens(l.Lens):
 
             alphabet = digits + ascii_uppercase
             name = ''.join(choices(alphabet, k=16))
-            logger.warning(f"No checkpoint path or name specified in calc_lens. Saving as {name} to lens_checkpoints.")
+            self.logger.warning(f"No checkpoint path or name specified in calc_lens. Saving as {name} to lens_checkpoints.")
             save_dir = os.path.join(os.getcwd(), "Jlens", "lens_checkpoints", name)
         
         parent = os.path.dirname(save_dir)
@@ -156,23 +157,23 @@ class Jlens(l.Lens):
         WARNING: No duplicate protection implemented. Just use the auto-save feature from calc_lens😡
         """
         if self.lens is None:
-            logger.error("No lens to save.")
+            self.logger.error("No lens to save.")
             return 1
         if path is None:
             path = os.path.join(os.getcwd(), "Jlens", "lens_checkpoints")
         try:
             self.lens.save(path)
-            logger.info(f"lens saved at {path}")
+            self.logger.info(f"lens saved at {path}")
             return 0
         except Exception as e:
             fallback = os.getcwd()
             fallback_path = os.path.join(fallback, os.path.basename(path))
-            logger.error(f"[Lens] failed to save to {path}({e}). Saved to {fallback_path}")
+            self.logger.error(f"[Lens] failed to save to {path}({e}). Saved to {fallback_path}")
             try:
                 self.lens.save(fallback_path)
                 return 0
             except Exception as e1:
-                logger.critical(f"Failed to save lens({e1}).")
+                self.logger.critical(f"Failed to save lens({e1}).")
                 return 1
                 
     def load_lens(self, path: str | None = None, name: str | None = None):
@@ -188,12 +189,12 @@ class Jlens(l.Lens):
 
         try:
             self.lens = JacobianLens.load(checkpoint_path)
-            logger.info(f"Successfully loaded lens from {checkpoint_path}")
+            self.logger.info(f"Successfully loaded lens from {checkpoint_path}")
         except Exception as e:
             raise RuntimeError(f"Failed loading lens from {checkpoint_path}({e}).")
 
 # TODO: Decide on a default value for max_length! Require testing on a physical device.
-def process_audio(records, processor, data_root: str, sampling_rate: int, max_length: int):
+def process_audio(records, processor, logger: logging.Logger, data_root: str, sampling_rate: int, max_length: int):
     """
     * Processes the audio.
     * Filters all samples with length(after encoding) longer than max_length

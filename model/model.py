@@ -1,6 +1,6 @@
-from Jlens import lens, Jlens as J, LogitLens as L
+from Jlens import lens, Jlens as J
 from model import instance as Inst
-import os, sys, time, torch, librosa, soundfile
+import os, sys, time, torch, librosa, soundfile, logging
 
 class Model:
     """
@@ -9,7 +9,12 @@ class Model:
     LogitLens is the default. To load Jlens, use load_lens(), and to calculate Jlens, use calc_Jlens().
     """
     #TODO: This is Qwen-specific, change this!
-    def __init__(self, do_4bit: bool = False, MODEL_ID="Qwen/Qwen2-Audio-7B-Instruct"):
+    def __init__(self,
+        logger: logging.Logger,
+        do_4bit: bool = False,
+        MODEL_ID="Qwen/Qwen2-Audio-7B-Instruct"):
+        
+        self.logger = logger
         self.model_id = MODEL_ID
         self.do_4bit = do_4bit
         self.lens: lens.Lens | None = None
@@ -30,7 +35,7 @@ class Model:
         pass
 
     def load_Jlens(self, lens_path: str | None = None, lens_name: str | None = None):
-        self.lens = J.Jlens(self.model)
+        self.lens = J.Jlens(logger = self.logger, model= self.model)
         self.lens.load_lens(path= lens_path, name= lens_name)
         self.lens_cache.clear_jlens()
 
@@ -54,7 +59,7 @@ class Model:
             raise RuntimeError(f"Jsonl file({jsonl_path}) does not exist.")
         parent_dir, jsonl_name = os.path.split(jsonl_path)
 
-        self.lens = J.Jlens(self.model)
+        self.lens = J.Jlens(logger= self.logger, model= self.model)
         self.lens.calc_lens(
             data_path= parent_dir,
             jsonl_name= jsonl_name,
@@ -94,63 +99,25 @@ class Model:
         )
         return result
 
-    def encode_prompt(self, json_line: str, MAX_LENGTH: int | None = 300):
-        return self.model.encode(json_line= json_line, max_length= MAX_LENGTH)
+    def encode_prompt(self, json_line: str, MAX_LENGTH: int = 300):
+        return self.model.encode(text= json_line, max_length= MAX_LENGTH)
         
-    def run_inference(self, jsonl_line: str, data_root):
+    def run_inference(
+        self,
+        jsonl_line: str,
+        data_root: str,
+        MAX_LENGTH: int = 300,
+    ):
+        """
+        * Returns the last hidden state
+        """
         self.model.load_data(data_root= data_root)
-        return self.model.forward(self.encode_prompt(jsonl_line))
-
-#TODO This can be moved to Master, 先不管
-def run_inference_smoke_test(model, processor, audio_path: str):
-    print("=" * 70)
-    print("[Step 3] 音訊 + 文字指令推論測試")
-    print("=" * 70)
-
-    audio, sr = librosa.load(audio_path, sr=processor.feature_extractor.sampling_rate)
-
-    conversation = [
-        {
-            "role": "user",
-            "content": [
-                {"type": "audio", "audio_url": audio_path},
-                {"type": "text", "text": "請描述這段音訊的內容。"},
-            ],
-        }
-    ]
-    text_prompt = processor.apply_chat_template(
-        conversation, add_generation_prompt=True, tokenize=False
-    )
-
-    inputs = processor(
-        text=text_prompt,
-        audio=[audio],
-        sampling_rate=sr,
-        return_tensors="pt",
-        padding=True,
-    )
-    inputs = {k: v.to(model.device) if hasattr(v, "to") else v for k, v in inputs.items()}
-
-    torch.cuda.reset_peak_memory_stats()
-    t0 = time.time()
-
-    with torch.no_grad():
-        generate_ids = model.generate(**inputs, max_new_tokens=128)
-
-    gen_time = time.time() - t0
-    vram_after_gen = torch.cuda.max_memory_allocated() / (1024 ** 3)
-
-    generate_ids = generate_ids[:, inputs["input_ids"].size(1):]
-    response = processor.batch_decode(
-        generate_ids, skip_special_tokens=True, clean_up_tokenization_spaces=False
-    )[0]
-
-    print(f"  生成耗時: {gen_time:.1f}s")
-    print(f"  推論階段 VRAM 峰值: {vram_after_gen:.2f} GB")
-    print(f"  模型輸出: {response!r}")
-    print()
-
-    return vram_after_gen
+        return self.model.unembed(
+            self.model.forward(
+                self.encode_prompt(jsonl_line, MAX_LENGTH=MAX_LENGTH)
+            )
+        )
+            
 
 from torch import Tensor
 class LensOutputCache:

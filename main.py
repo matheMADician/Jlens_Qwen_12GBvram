@@ -1,4 +1,4 @@
-import Jlens_Qwen_new.Master as M
+from Master import Master
 
 if __name__ == "__main__":
-    main = M.Main()
+    Master().test_inference()
