@@ -1,5 +1,5 @@
-from jacobian_lens.jlens.fitting import fit as jlens_fit
-from jacobian_lens.jlens.lens import JacobianLens
+from jlens.fitting import fit as jlens_fit
+from jlens.lens import JacobianLens
 import sys, os, json, librosa, logging
 from Jlens import lens as l
 from model.instance import Instance
@@ -27,7 +27,8 @@ class Jlens(l.Lens):
 
     def calc_lens(self, data_path: str, jsonl_name: str, do_replace: bool = False,
                   checkpoint_path: str | None = None, run_name: str | None = None,
-                  dim_batch: int = 32, MAX_SEQ_LEN: int = 300, checkpoint_every: int = 5):
+                  dim_batch: int = 32, MAX_SEQ_LEN: int = 300, checkpoint_every: int = 5,
+                  is_test: bool = False):
         """
         * Calculates Jlens for the specified model using data in the given data_path.
         * If run_name is specified, the function ignores the path and looks for it in ~/Jlens/lens_checkpoints/*name*
@@ -43,7 +44,9 @@ class Jlens(l.Lens):
         self._load_data(data_path)
         self.logger.info("Loading metadata from %s", jsonl_path)
         records = parser.load_jsonl_lines(jsonl_path)
+        if is_test: records = [records[0]]    
         self.logger.info("Loaded %d samples", len(records))
+        print("Loaded %d samples", len(records))
     
         self.logger.info("Filtering samples by length (max_seq_len=%d) before fitting...", MAX_SEQ_LEN)
         records = process_audio(
@@ -60,6 +63,8 @@ class Jlens(l.Lens):
         n_layers = self.model.n_layers  # 應為 32
         source_layers = list(range(n_layers - 1))  # 0..30，共 31 層
         target_layer = n_layers - 1  # 31
+        
+        if is_test: source_layers = [n_layers - 2]
     
         self.logger.info(
             "Fitting all %d layers together: source_layers=%s..%s, target_layer=%s",

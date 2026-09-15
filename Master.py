@@ -1,9 +1,8 @@
 import model.model as M
-import parser
-import os, sys, torch, json, logging
+import parser, os, sys, torch, json, logging
 
 class Master:
-    def __init__(self):
+    def __init__(self, run_name: str | None = None):
         self.check_dependencies()
         self.parser = parser.Parser()
         self.logger = logging.getLogger()
@@ -11,6 +10,7 @@ class Master:
         self.model = M.Model(logger= self.logger,
             do_4bit= self.settings["do_4bit"],
             MODEL_ID= self.settings["Model_ID"])
+        self.run_name = run_name
 
     def test_inference(self):
         data_root = self.settings.get("Inference_data_root")
@@ -46,7 +46,23 @@ class Master:
         return logits
 
     def test_training(self):
-        pass
+        if not self.run_name:
+            raise ValueError("test_training() 需要提供 --run-name")
+
+        run_directory = os.path.join(
+            self.settings["Jlens_checkpoint_path"],
+            self.run_name
+        )
+        checkpoint_path = os.path.join(run_directory, "fit.pt")
+        print(f"Checkpoint path: {checkpoint_path}")
+        os.makedirs(run_directory, exist_ok=True)
+            
+        self.model.fit_Jlens(
+            jsonl_path= self.settings["Inference_jsonl"],
+            checkpoint_save_path= checkpoint_path,
+            run_name= self.run_name,
+            is_test=True,
+        )
     
     def test_lens(self):
         pass

@@ -1,4 +1,8 @@
 {
     "python-envs.defaultEnvManager": "ms-python.python:conda",
-    "python-envs.defaultPackageManager": "ms-python.python:conda"
+    "python-envs.defaultPackageManager": "ms-python.python:conda",
+    "python.defaultInterpreterPath": "/home/c8763c8763/.conda/envs/jlens/bin/python",
+    "python.analysis.extraPaths": [
+        "${workspaceFolder}/jacobian_lens"
+    ]
 }

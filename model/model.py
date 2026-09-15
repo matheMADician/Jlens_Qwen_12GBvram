@@ -46,7 +46,8 @@ class Model:
             MAX_SEQ_LEN: int = 300,
             do_replace: bool = False,
             checkpoint_save_path: str | None = None,
-            run_name: str | None = None
+            run_name: str | None = None,
+            is_test: bool = False
             ):
         """
         * Calls the calc_lens() function in Jlens.
@@ -68,7 +69,8 @@ class Model:
             run_name= run_name,
             dim_batch= dim_batch,
             MAX_SEQ_LEN= MAX_SEQ_LEN,
-            checkpoint_every= checkpoint_interval
+            checkpoint_every= checkpoint_interval,
+            is_test= is_test
             )
         self.lens_cache.clear_jlens()
 

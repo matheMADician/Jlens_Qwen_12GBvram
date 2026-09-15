@@ -1,4 +1,4 @@
-from jacobian_lens.jlens.protocol import LensModel
+from jlens.protocol import LensModel
 import parser as J
 import json, os, logging, time
 import librosa, torch

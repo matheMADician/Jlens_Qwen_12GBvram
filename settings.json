@@ -2,7 +2,8 @@
     "do_4bit": false,
     "Model_ID": "Qwen/Qwen2-Audio-7B-Instruct",
     "Jlens_Max_Seq_Len": 300,
-    "Inference_data_root": "data/jlens_dataset/Audio",
+    "Inference_data_root": "data/jlens_dataset", 
     "Inference_jsonl": "data/jlens_dataset/metadata_EN.jsonl",
-    "Inference_max_length": 300
+    "Inference_max_length": 300,
+    "Jlens_checkpoint_path": "Jlens/checkpoints"
 }
