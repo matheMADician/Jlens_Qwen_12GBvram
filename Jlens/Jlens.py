@@ -1,6 +1,6 @@
 from jacobian_lens.jlens.fitting import fit as jlens_fit
 from jacobian_lens.jlens.lens import JacobianLens
-import os, json, librosa, logging
+import sys, os, json, librosa, logging
 from Jlens import lens as l
 from model.instance import Instance
 

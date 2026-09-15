@@ -125,7 +125,18 @@ pip install "accelerate==1.14.0"
 # 5. 音訊處理（Qwen2-Audio 相關）
 # -----------------------------------------------------------------------------
 log_info "安裝 librosa 0.11.0 / soundfile 0.14.0 ..."
-pip install "librosa==0.11.0" "soundfile==0.14.0"
+pip install \
+    "librosa==0.11.0" \
+    "soundfile==0.14.0" \
+    datasets \
+    "torchcodec==0.2.1"
+
+# torchcodec 需要系統 FFmpeg 動態函式庫（libavutil/libavcodec 等）。
+if ! command -v ffmpeg >/dev/null 2>&1; then
+    log_error "找不到 FFmpeg，torchcodec 無法解碼 FLEURS 音訊。"
+    log_error "請先執行：sudo apt-get install -y ffmpeg"
+    exit 1
+fi
 
 # soundfile 需要系統 libsndfile
 if ! ldconfig -p | grep -q libsndfile; then
@@ -173,6 +184,8 @@ pkgs = [
     ("accelerate",    "accelerate"),
     ("librosa",       "librosa"),
     ("soundfile",     "soundfile"),
+    ("datasets",      "datasets"),
+    ("torchcodec",    "torchcodec"),
     ("jlens",         "jacobian-lens"),
 ]
 

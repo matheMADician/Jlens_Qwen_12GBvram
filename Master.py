@@ -1,23 +1,6 @@
 import model.model as M
-import data.data as data
 import parser
-from Jlens import Jlens as J
-import sys, torch, json, logging
-
-#TODO: Apply this
-"""
-parser = argparse.ArgumentParser(description="General fit J-Lens")
-parser.add_argument("--data-root", default="g_data",
-                    help="工作目錄，內含 jlens_dataset/prompts.jsonl 與 jlens_dataset/audio/")
-parser.add_argument("--jsonl-name", required=True, help="輸入的 JSONL : --jsonl-name")
-parser.add_argument("--model-name", default="Qwen/Qwen2-Audio-7B-Instruct")
-parser.add_argument("--checkpoint-path", required=True, help="輸出的 ckpt : --checkpoint-path")
-parser.add_argument("--dim-batch", type=int, default=32)
-parser.add_argument("--max-seq-len", type=int, default=256)
-parser.add_argument("--device", default="cuda")
-parser.add_argument("--checkpoint-every", type=int, default=5)
-args = parser.parse_args()"""
-
+import os, sys, torch, json, logging
 
 class Master:
     def __init__(self):
@@ -30,9 +13,37 @@ class Master:
             MODEL_ID= self.settings["Model_ID"])
 
     def test_inference(self):
-        text_line = "" #TODO
-        logits = self.model.run_inference(jsonl_line= text_line, data_root= "")
-        pass
+        data_root = self.settings.get("Inference_data_root")
+        jsonl_path = self.settings.get("Inference_jsonl")
+        max_length = self.settings.get("Inference_max_length", 300)
+
+        if not data_root or not jsonl_path:
+            raise ValueError(
+                "請在 settings.json 設定 Inference_data_root 與 Inference_jsonl"
+            )
+
+        data_root = os.path.abspath(data_root)
+        jsonl_path = os.path.abspath(jsonl_path)
+        lines = self.parser.load_jsonl_lines(jsonl_path)
+        if not lines:
+            raise ValueError(f"JSONL 沒有可推論的樣本：{jsonl_path}")
+
+        logits = self.model.run_inference(
+            jsonl_line=lines[0],
+            data_root=data_root,
+            MAX_LENGTH=max_length,
+        )
+        if logits.ndim != 3:
+            raise RuntimeError(
+                f"推論結果預期為 [batch, seq_len, vocab]，實際 shape={tuple(logits.shape)}"
+            )
+
+        next_token_logits = logits[0, -1]
+        top_ids = torch.topk(next_token_logits, k=5).indices.tolist()
+        top_tokens = self.model.model.tokenizer.convert_ids_to_tokens(top_ids)
+        print(f"推論完成：logits shape={tuple(logits.shape)}")
+        print(f"下一個 token 候選：{top_tokens}")
+        return logits
 
     def test_training(self):
         pass
