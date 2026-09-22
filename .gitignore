@@ -1,0 +1,27 @@
+# Python cache and local environments
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.ruff_cache/
+.ipynb_checkpoints/
+
+# Local datasets and downloaded audio
+/data/**/*.wav
+/data/**/*.mp3
+/data/**/*.flac
+/data/**/*.jsonl
+
+# Model checkpoints and generated outputs
+/Jlens/checkpoints/
+/Jlens/lens_checkpoints/
+/model/inference/
+/tools/heatmaps/
+*.pt
+outputs.txt
+slurm-*.out
+
+# Local debug/config files
+.vscode/
+How_to_Run_debug.txt

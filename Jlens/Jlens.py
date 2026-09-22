@@ -1,6 +1,7 @@
 from jlens.fitting import fit as jlens_fit
 from jlens.lens import JacobianLens
 import sys, os, json, librosa, logging
+import torch
 from Jlens import lens as l
 from model.instance import Instance
 
@@ -10,12 +11,7 @@ class Jlens(l.Lens):
     """
     Master class of all Jlens related methods.
     """
-    def __init__(self, logger: logging.Logger, model: Instance | None = None):
-        super().__init__()
-        if model is None: raise ValueError("No model passed to Jlens.")
-        if not isinstance(model, Instance):
-            raise TypeError("Jlens requires an initialized Instance.")
-        
+    def __init__(self, logger: logging.Logger, model: Instance):
         self.model = model
         self.lens = None
         self.logger = logger
@@ -122,13 +118,27 @@ class Jlens(l.Lens):
         self.save_lens(path = save_dir)
 
     #TODO: This is Qwen-specific. Has to be changed to work for more models.
-    def apply_lens( self, do_activate_Jacobian: bool = True,
-        json_line: str | None = None, layers_available: list[int] | None = None,
-        MAX_SEQ_LEN: int = 300, data_root: str | None = None ):
+    def apply_lens(
+            self, 
+            do_activate_Jacobian: bool = True,
+            json_line: str | None = None,
+            layers_available: list[int] | None = None,
+            positions: list[int] | None = None,
+            top_k: int = 5,
+            MAX_SEQ_LEN: int = 300,
+            data_root: str | None = None ):
         """
         * Applies Lens to model. To use LogitLens, use do_activate_Jacobian = False
         * json_line takes raw json data.
         * Returns in order: lens_logits, model_logits, input_ids
+        * The dimension of the returned data is
+        
+        lens_logits[layer].shape
+            =[len(positions), vocab_size]
+        model_logits.shape
+            =[len(positions), vocab_size]
+        input_ids.shape
+            =[1, sequence_length]
         """
         if self.lens is None:
             raise RuntimeError("Jlens not yet calculated, please call calc_lens() before applying.")
@@ -138,8 +148,6 @@ class Jlens(l.Lens):
         run_layers = []
         if layers_available is None:
             if do_activate_Jacobian:
-                #? Does Anthropic's code accept the last layer in Jlens functions? Needs investigation.
-                #  If not, just use Logitlens instead.
                 run_layers = list(range(self.model.n_layers - 1))
             else:
                 run_layers = list(range(self.model.n_layers))
@@ -150,8 +158,12 @@ class Jlens(l.Lens):
             raise ValueError("Missing Json line.")
         
         lens_logits, model_logits, input_ids = self.lens.apply(
-            self.model, json_line, layers=run_layers, positions=None,
-            max_seq_len=MAX_SEQ_LEN, use_jacobian=do_activate_Jacobian,
+            model= self.model,
+            prompt= json_line,
+            layers= run_layers,
+            positions= positions,
+            max_seq_len= MAX_SEQ_LEN,
+            use_jacobian= do_activate_Jacobian,
         )
 
         return lens_logits, model_logits, input_ids

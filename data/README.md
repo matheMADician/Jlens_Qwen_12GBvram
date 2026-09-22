@@ -1,0 +1,1 @@
+Use get_data.sh to get your datasets, then run assemble_json.sh to get the final json for training/validation

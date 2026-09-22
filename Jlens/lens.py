@@ -1,7 +1,10 @@
 from abc import ABC, abstractmethod
+import logging
+from model.instance import Instance
+
 class Lens(ABC):
     @abstractmethod
-    def __init__(self):
+    def __init__(self, logger: logging.Logger, model: Instance):
         pass
 
     from torch import Tensor
@@ -10,6 +13,8 @@ class Lens(ABC):
         do_activate_Jacobian: bool,
         json_line: str,
         layers_available,
-        MAX_SEQ_LEN,
+        positions: list[int] | None,
+        top_k: int,
+        MAX_SEQ_LEN: int,
         data_root) -> tuple[dict[int, Tensor], Tensor, Tensor]:
         pass

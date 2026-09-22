@@ -165,7 +165,8 @@ if [[ "${SKIP_JLENS:-0}" != "1" ]]; then
         plotly \
         jupyter \
         ipykernel \
-        tqdm
+        tqdm \
+        
 else
     log_warn "SKIP_JLENS=1，跳過 jacobian-lens 安裝。"
 fi

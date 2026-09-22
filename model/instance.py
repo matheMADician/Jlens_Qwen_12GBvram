@@ -6,7 +6,6 @@ from transformers import Qwen2AudioForConditionalGeneration, AutoProcessor, Bits
 
 logger = logging.getLogger(__name__)
 
-
 class Instance(LensModel):
     """
     Qwen2-Audio 的 adapter，給 JLens 使用。

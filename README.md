@@ -4,8 +4,9 @@
 Qwen2-Audio 語音語言模型，分析音訊與文字輸入在 language model
 不同層的 residual representation。
 
-目前專案仍在開發中。底層的 JLens adapter 已完成主要設計，高層的
-model wrapper 與實驗控制流程則會在取得雲端 GPU 算力後繼續補齊與驗證。
+目前專案仍在開發中，但已支援 JLens fitting、套用 JLens/Logit Lens、
+輸出 top-k CSV，以及比較一個或兩個 JLens checkpoint 的 layer similarity
+heatmap。
 
 ## 專案架構
 
@@ -109,6 +110,24 @@ dataset/
 
 其中 `audio_path` 是相對於 dataset 根目錄的路徑。
 
+### 從 Hugging Face FLEURS 下載英文資料
+
+`data/get_data.py` 可以直接下載 FLEURS。以下範例下載美式英文資料：
+
+```bash
+python data/get_data.py \
+  --dataset google/fleurs \
+  --config en_us \
+  --split train \
+  --target 100 \
+  --output data/fleurs_en_us \
+  --text-column transcription \
+  --overwrite
+```
+
+其他英文 config 可使用 `en_gb`、`en_au`、`en_in` 或 `en_ng`。
+每個 config 請輸出到不同資料夾。
+
 JLens 在 fitting 或 applying 前，需要先讓 `Instance` 載入資料根目錄：
 
 ```python
@@ -118,9 +137,41 @@ instance.load_data("dataset")
 在目前的 wrapper 設計中，這項工作由 `Jlens.calc_lens()` 或
 `Jlens.apply_lens(data_root=...)` 負責。
 
-## 目前預計使用方式
+## 使用方式
 
-以下是目前設計的使用方向；完整流程尚未在雲端 GPU 上完成 smoke test。
+### 設定檔
+
+`settings.json` 按照用途分組：
+
+```json
+{
+  "model": {
+    "id": "Qwen/Qwen2-Audio-7B-Instruct",
+    "load_in_4bit": false
+  },
+  "data": {
+    "root": "data",
+    "jsonl_path": "data/esc50-50_fleurs_en_us-50.jsonl"
+  },
+  "training": {
+    "max_seq_len": 300
+  },
+  "checkpoints": {
+    "root": "Jlens/checkpoints",
+    "load_path": "Jlens/lens_checkpoints/esc50-50_fleurs_en_us-50"
+  },
+  "inference": {
+    "jsonl_path": "data/prompts.jsonl",
+    "max_length": 300,
+    "output_root": "model/inference",
+    "test_jsonl_path": "data/for_inference.jsonl",
+    "top_k": 5
+  }
+}
+```
+
+執行前請確認 `data.root`、`data.jsonl_path` 和
+`checkpoints.load_path` 指向目前要使用的資料與 checkpoint。
 
 ### 建立模型
 
@@ -165,6 +216,48 @@ lens_logits, model_logits, input_ids = result
 設定 `do_activate_Jacobian=False` 時，可使用相同入口執行
 vanilla Logit Lens baseline，並保存到另一份 cache。
 
+### 使用 Master 執行
+
+```bash
+python main.py --run-name esc50-50_fleurs_en_us-50
+```
+
+目前 `main.py` 會建立 `Master` 並執行 `apply_Jlens()`。在 Slurm 環境中，
+也可以使用：
+
+```bash
+sbatch job.sh
+squeue --me
+scontrol show job <JOBID>
+cat slurm-<JOBID>.out
+```
+
+### 繪製 JLens heatmap
+
+`Master.draw_Jlens_heatmap()` 會比較 Jacobian matrices 本身，不是 activation
+CKA。單一 JLens 會產生 layer × layer 的 cosine similarity；指定第二個
+checkpoint 時，會產生 `lens1 layer × lens2 layer` 的比較圖。
+
+```python
+from Master import Master
+
+master = Master(run_name="heatmap")
+heatmap = master.draw_Jlens_heatmap(
+  heatmap_path="tools/heatmaps/jlens_comparison.png",
+  lens_path1="Jlens/lens_checkpoints/esc50-50_fleurs_en_us-50",
+  lens_path2="Jlens/lens_checkpoints/esc50-50_libri-50",
+)
+```
+
+回傳的 `heatmap` 是 shape 為
+`[len(lens1_layers), len(lens2_layers)]` 的 PyTorch tensor。
+
+### 中文 CSV 顯示
+
+模型輸出會寫入 `inference.output_root`，CSV 使用 UTF-8 with BOM，方便
+Excel 正確辨識中文。修改輸出編碼後，請重新產生 CSV；既有 CSV 不會自動
+補上 BOM。
+
 ## 尚待完成與驗證
 
 以下項目暫時保留，等雲端算力可用後再處理。
@@ -179,9 +272,8 @@ vanilla Logit Lens baseline，並保存到另一份 cache。
 - 確認 processor 產生的 audio token 數量與 projector output
   token 數量一致
 - 確認目前 prompt 是否需要套用 Qwen2-Audio chat template
-- 修正並驗證 `fit_Jlens()` 的實際呼叫流程
 - 在 GPU 上測試 JLens fitting 的 batch、記憶體與 checkpoint resume
-- 驗證 `do_activate_Jacobian=True/False` 兩種輸出是否都能正確保存
+- 擴充不同模型的 `LensModel` adapter
 
 ### Model wrapper
 
@@ -189,18 +281,12 @@ vanilla Logit Lens baseline，並保存到另一份 cache。
 - 明確區分 raw Hugging Face model 與 JLens `Instance`
 - 完成一般語音 generation API
 - 決定並實作 `run_inference()` 的正式語意
-- 補上 cache 的 `.detach().cpu()` 策略
-- 補上 cache 讀取與清除的公開 API
-- 修正 package import 路徑並確認不同啟動方式都能使用
+- 完成 `get_model_info()`
 
 ### Master 與啟動流程
 
-- 完成 `Master` 的 initialization 與實驗控制 API
-- 修正 `main.py` 目前與 `Master` 類別名稱不一致的問題
-- 從 `settings.json` 讀取資料集、checkpoint 與實驗參數
-- 決定 fitting、JLens apply、Logit Lens apply 與一般 generation
-  的執行順序
-- 加入實驗結果輸出格式
+- 完成更完整的 fitting/apply/inference CLI 選項
+- 加入 heatmap 與 inference 的自動化實驗輸出
 
 ### 其他限制
 

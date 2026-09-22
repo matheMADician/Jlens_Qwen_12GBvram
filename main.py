@@ -11,4 +11,11 @@ parser.add_argument(
 if __name__ == "__main__":
     args = parser.parse_args()
     master = Master(run_name=args.run_name)
-    master.test_training()
+    master.apply_Jlens()
+    """
+    master.draw_Jlens_heatmap(
+        heatmap_path= "tools/heatmaps",
+        lens_path1= "Jlens/lens_checkpoints/esc50-50_fleurs_en_us-50",
+        lens_path2= "Jlens/lens_checkpoints/esc50-50_libri-50"
+    )
+    """

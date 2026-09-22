@@ -1,0 +1,11 @@
+1. $ module load miniconda3
+2. $ conda activate jlens
+
+Debug:
+3. $ bash start_debug.sh
+4. Edit main.py and settings.json
+5. $ python main.py --run-name <run name>
+6. *IMPORTANT* $ exit
+
+Submit:
+3. $ sbatch job.sh

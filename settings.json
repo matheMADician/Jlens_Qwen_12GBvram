@@ -1,9 +1,24 @@
 {
-    "do_4bit": false,
-    "Model_ID": "Qwen/Qwen2-Audio-7B-Instruct",
-    "Jlens_Max_Seq_Len": 300,
-    "Inference_data_root": "data/jlens_dataset", 
-    "Inference_jsonl": "data/jlens_dataset/metadata_EN.jsonl",
-    "Inference_max_length": 300,
-    "Jlens_checkpoint_path": "Jlens/checkpoints"
+    "model": {
+        "id": "Qwen/Qwen2-Audio-7B-Instruct",
+        "load_in_4bit": false
+    },
+    "data": {
+        "root": "data",
+        "jsonl_path": "data/esc50-50_fleurs_en_us-50.jsonl"
+    },
+    "training": {
+        "max_seq_len": 300
+    },
+    "checkpoints": {
+        "root": "Jlens/checkpoints",
+        "load_path": "Jlens/lens_checkpoints/esc50-50_fleurs_en_us-50"
+    },
+    "inference": {
+        "jsonl_path": "data/prompts.jsonl",
+        "max_length": 300,
+        "output_root": "model/inference",
+        "test_jsonl_path": "data/for_inference.jsonl",
+        "top_k": 5
+    }
 }
