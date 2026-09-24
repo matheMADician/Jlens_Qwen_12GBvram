@@ -25,3 +25,6 @@ slurm-*.out
 # Local debug/config files
 .vscode/
 How_to_Run_debug.txt
+
+# Separate project and local analysis artifacts
+/Other_stuff/

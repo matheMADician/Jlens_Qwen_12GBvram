@@ -3,9 +3,10 @@ from jlens.lens import JacobianLens
 import sys, os, json, librosa, logging
 import torch
 from Jlens import lens as l
+from Jlens.Subset_fitting import subset_fit
 from model.instance import Instance
 
-#TODO seperate json and audio loading from this class
+#TODO update the fit function for subset fitting
 
 class Jlens(l.Lens):
     """
