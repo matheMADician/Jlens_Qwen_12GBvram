@@ -157,13 +157,13 @@ instance.load_data("dataset")
     "max_seq_len": 300
   },
   "checkpoints": {
-    "root": "Jlens/checkpoints",
-    "load_path": "Jlens/lens_checkpoints/esc50-50_fleurs_en_us-50"
+    "root": "output/checkpoints",
+    "load_path": "output/checkpoints/esc50-50_fleurs_en_us-50/lens.pt"
   },
   "inference": {
     "jsonl_path": "data/prompts.jsonl",
     "max_length": 300,
-    "output_root": "model/inference",
+    "output_root": "output/inference",
     "test_jsonl_path": "data/for_inference.jsonl",
     "top_k": 5
   }
@@ -183,6 +183,10 @@ model = Model(
     do_4bit=False,
 )
 ```
+
+Model weights load lazily: `Model(...)` only configures the wrapper. Training and
+inference load the model on first use and reuse that instance afterward. To
+preload explicitly, call `model.load_model()`.
 
 ### Fitting JLens
 
@@ -243,9 +247,9 @@ from Master import Master
 
 master = Master(run_name="heatmap")
 heatmap = master.draw_Jlens_heatmap(
-  heatmap_path="tools/heatmaps/jlens_comparison.png",
-  lens_path1="Jlens/lens_checkpoints/esc50-50_fleurs_en_us-50",
-  lens_path2="Jlens/lens_checkpoints/esc50-50_libri-50",
+  heatmap_path="output/heatmaps/jlens_comparison.png",
+  lens_path1="output/checkpoints/esc50-50_fleurs_en_us-50/lens.pt",
+  lens_path2="output/checkpoints/esc50-50_libri-50/lens.pt",
 )
 ```
 
@@ -327,4 +331,3 @@ bash dependencies.sh
 - 將實驗流程放在 `Master` 或未來新增的 experiment module
 - 不在模型初始化時自動執行實驗
 - 先完成單筆 smoke test，再進行完整 fitting
-

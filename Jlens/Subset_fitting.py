@@ -36,7 +36,7 @@ from jacobian_lens.jlens.lens import JacobianLens
 from jacobian_lens.jlens.protocol import LensModel
 
 # Original fitting.py methods
-from jacobian_lens.jlens.fitting import _check_layer_indices, valid_position_mask, _atomic_save
+from jacobian_lens.jlens.fitting import _check_layer_indices, valid_position_mask, _atomic_save, fit
 
 #: Positions before this index are excluded from the Jacobian average; early
 #: positions act as attention sinks and have atypical residual statistics.
@@ -108,6 +108,7 @@ def subset_jacobian_for_prompt(
                 f"{name} must contain positions in [0, {seq_len}); "
                 f"got {list(positions)}"
             )
+           
         position_tensor = position_tensor[position_mask[position_tensor]]
         if position_tensor.numel() == 0:
             raise ValueError(
@@ -192,9 +193,9 @@ def subset_jacobian_for_prompt(
 def subset_fit(
     model: LensModel,
     prompts: Sequence[str],
-    *,
-    source_tokens: Sequence[int],
-    target_tokens: Sequence[int],
+    prompt_len: Sequence[int],
+    text_len: Sequence[int],
+    mode: str | None = None,
     source_layers: Sequence[int] | None = None,
     target_layer: int | None = None,
     dim_batch: int = 8,
@@ -221,10 +222,20 @@ def subset_fit(
         model: The model to fit on.
         prompts: Text prompts to average over. See the README for guidance on
             corpus size and distribution.
-        source_tokens: Token positions whose source gradients are averaged for
-            each prompt.
-        target_tokens: Token positions whose target activations receive the
-            cotangent for each prompt; their contributions are summed.
+        prompt_len: Tokenized input length for each prompt, in the same order as
+            ``prompts``. The current ``process_audio`` implementation records
+            the full ``input_ids`` length, including audio and text tokens.
+            These lengths are used to construct per-prompt position ranges;
+            ``valid_position_mask`` then removes excluded positions.
+        text_len: Number of text tokens at the end of each encoded prompt, in
+            the same order as ``prompts``. Target positions are restricted to
+            this text-only suffix.
+        mode: Defines the source and target tokens for Jacobian matrix calculation.
+            Can be one of the following:
+            - "S2T"
+            - "T2T"
+            - "S&T2T"
+            - "None" (Will use ordinary fit_jlens() function)
         source_layers: Layers to fit at. Defaults to every layer below
             ``target_layer``; negative indices count from the end.
         target_layer: See :func:`subset_jacobian_for_prompt`. Defaults to the
@@ -243,6 +254,26 @@ def subset_fit(
     Returns:
         The fitted :class:`JacobianLens`.
     """
+    
+    if mode is None:
+        return fit(
+            model=model,
+            prompts=prompts,
+            source_layers=source_layers,
+            target_layer=target_layer,
+            dim_batch=dim_batch,
+            max_seq_len=max_seq_len,
+            skip_first=skip_first,
+            checkpoint_path=checkpoint_path,
+            checkpoint_every=checkpoint_every
+        )
+    
+    if len(prompts) != len(prompt_len) or len(prompts) != len(text_len):
+        raise ValueError(
+            "prompts, prompt_len, and text_len must have the same length; "
+            f"got {len(prompts)}, {len(prompt_len)}, and {len(text_len)}"
+        )
+
     n_layers, d_model = model.n_layers, model.d_model
     source_layers, target_layer = _check_layer_indices(
         source_layers, target_layer, n_layers
@@ -313,7 +344,30 @@ def subset_fit(
         if prompt_idx < next_idx:
             continue
         start_time = time.perf_counter()
+        # ``prompt_len`` is the tokenized input length recorded by
+        # process_audio, so derive positions per prompt instead of reusing one
+        # fixed range for prompts with different audio durations.
+        prompt_count = prompt_len[prompt_idx]
+        prompt_text_count = text_len[prompt_idx]
+        
+        if mode == "S2T":
+            source_tokens = range(prompt_count - prompt_text_count)
+            target_tokens = range(prompt_count - prompt_text_count, prompt_count)
+        elif mode == "S2S":
+            source_tokens = range(prompt_count)
+            target_tokens = source_tokens
+        elif mode == "T2T":
+            source_tokens = range(prompt_count - prompt_text_count, prompt_count)
+            target_tokens = source_tokens
+        elif mode == "S&T2T":
+            source_tokens = range(prompt_count)
+            target_tokens = range(prompt_count - prompt_text_count, prompt_count)
+        else:
+            raise ValueError("Modes in subset_fit() must be either S2T, S2S or T2T.")
+        
         try:
+            # got this:
+            # skipping prompt 0: target_tokens must contain positions in [0, 134); got [134, 135, 136, 137, 138, 139, 140]
             per_prompt_J, seq_len, n_valid = subset_jacobian_for_prompt(
                 model,
                 prompt,

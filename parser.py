@@ -10,7 +10,7 @@ class Parser:
 
     def load_jsonl_lines(self, path: str) -> list[str]:
         """
-        * Accepts the absolute path to the audio.
+        * Accepts the absolute path to the jsonl file.
         * Parses the jsonl file into lines.
         """
         if not os.path.isfile(path):

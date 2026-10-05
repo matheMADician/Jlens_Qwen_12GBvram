@@ -6,7 +6,7 @@ import json
 class Model:
     """
     Master class of all model methods.
-    Automatically loads the model on creation.
+    Loads the model on demand; repeated load_model() calls reuse the same instance.
     LogitLens is the default. To load Jlens, use load_lens(), and to calculate Jlens, use calc_Jlens().
     """
     #TODO: This is Qwen-specific, change this!
@@ -19,17 +19,35 @@ class Model:
         self.model_id = MODEL_ID
         self.do_4bit = do_4bit
         self.lens: lens.Lens | None = None
+        self._model: Inst.Instance | None = None
+        self.lens_cache = LensOutputCache()
 
-        self.model = Inst.Instance(
-            MODEL_ID=MODEL_ID,
-            do_4bit=do_4bit,
-        )
-        self.hf_model, self.processor = self.model.get_model()
+    def load_model(self) -> Inst.Instance:
+        """Load the model once, reusing it on subsequent calls."""
+        if self._model is None:
+            model = Inst.Instance(
+                MODEL_ID=self.model_id,
+                do_4bit=self.do_4bit,
+            )
+            self._model = model
+            self.lens_cache.tokenizer = model.tokenizer
+        return self._model
 
-        self.lens_cache = LensOutputCache(tokenizer=self.model.tokenizer)
+    @property
+    def model(self) -> Inst.Instance:
+        return self.load_model()
+
+    @property
+    def hf_model(self):
+        return self.load_model().hf_model
+
+    @property
+    def processor(self):
+        return self.load_model().processor
 
     def get_model(self):
-        return self.model, self.processor
+        model = self.load_model()
+        return model, model.processor
 
     def get_model_info(self):
         #TODO
@@ -37,9 +55,9 @@ class Model:
 
     def load_Jlens(self, lens_path: str | None = None, lens_name: str | None = None):
         """
-        * If name is specified, the function ignores the path and looks for it in ~/Jlens/lens_checkpoints/*name*
+        * If name is specified, the function ignores the path and looks for it in output/checkpoints/*name*/lens.pt
         """
-        self.lens = J.Jlens(logger = self.logger, model= self.model)
+        self.lens = J.Jlens(logger=self.logger)
         self.lens.load_lens(path= lens_path, name= lens_name)
         self.lens_cache.clear_jlens()
 
@@ -49,6 +67,7 @@ class Model:
             checkpoint_interval: int = 5,
             MAX_SEQ_LEN: int = 300,
             do_replace: bool = False,
+            mode: str | None = None,
             checkpoint_save_path: str | None = None,
             run_name: str | None = None,
             is_test: bool = False
@@ -67,11 +86,13 @@ class Model:
             raise RuntimeError(f"Jsonl file({jsonl_path}) does not exist.")
         parent_dir, jsonl_name = os.path.split(jsonl_path)
 
-        self.lens = J.Jlens(logger= self.logger, model= self.model)
+        model = self.load_model()
+        self.lens = J.Jlens(logger=self.logger, model=model)
         self.lens.calc_lens(
             data_path= parent_dir,
             jsonl_name= jsonl_name,
-            do_replace= do_replace, 
+            do_replace= do_replace,
+            mode= mode,
             checkpoint_path= checkpoint_save_path,
             run_name= run_name,
             dim_batch= dim_batch,
@@ -98,11 +119,14 @@ class Model:
         """
         if self.lens is None and use_Jlens:
             raise ValueError("No lens in model. Call fit_Jlens() / load_Jlens() first.")
-        elif self.lens is None:
+        model = self.load_model()
+        if self.lens is None:
             self.lens = L.LogitLens(
                 logger= self.logger,
-                model= self.model
+                model=model
             )
+        elif isinstance(self.lens, J.Jlens):
+            self.lens.model = model
         
         # Do both Jlens and LogitLens when not testing
         runs = [True, False] if use_Jlens else [False]
@@ -126,7 +150,7 @@ class Model:
             self.lens_cache.save(save_path= save_path, run_name= run_name, top_k= top_k)
 
     def encode_prompt(self, json_line: str, MAX_LENGTH: int = 300):
-        return self.model.encode(text= json_line, max_length= MAX_LENGTH)
+        return self.load_model().encode(text=json_line, max_length=MAX_LENGTH)
         
     def run_inference(
         self,
@@ -137,9 +161,10 @@ class Model:
         """
         * Returns the last hidden state
         """
-        self.model.load_data(data_root= data_root)
-        return self.model.unembed(
-            self.model.forward(
+        model = self.load_model()
+        model.load_data(data_root=data_root)
+        return model.unembed(
+            model.forward(
                 self.encode_prompt(jsonl_line, MAX_LENGTH=MAX_LENGTH)
             )
         )

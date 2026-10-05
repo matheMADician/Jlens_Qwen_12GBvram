@@ -14,13 +14,10 @@ __pycache__/
 /data/**/*.jsonl
 
 # Model checkpoints and generated outputs
-/Jlens/checkpoints/
+/output/
 /Jlens/lens_checkpoints/
-/model/inference/
-/tools/heatmaps/
 *.pt
 outputs.txt
-slurm-*.out
 
 # Local debug/config files
 .vscode/

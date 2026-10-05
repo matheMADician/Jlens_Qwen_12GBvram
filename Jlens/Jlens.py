@@ -1,7 +1,6 @@
 from jlens.fitting import fit as jlens_fit
 from jlens.lens import JacobianLens
-import sys, os, json, librosa, logging
-import torch
+import os, json, librosa, logging
 from Jlens import lens as l
 from Jlens.Subset_fitting import subset_fit
 from model.instance import Instance
@@ -12,23 +11,39 @@ class Jlens(l.Lens):
     """
     Master class of all Jlens related methods.
     """
-    def __init__(self, logger: logging.Logger, model: Instance):
+    def __init__(self, logger: logging.Logger, model: Instance | None = None):
         self.model = model
         self.lens = None
         self.logger = logger
 
+    def _require_model(self) -> Instance:
+        if self.model is None:
+            raise RuntimeError(
+                "A model instance is required for fitting or applying a JLens."
+            )
+        return self.model
+
     def _load_data(self, data_root: str):
         if not data_root:
             raise ValueError("No data root passed to Jlens.")
-        self.model.load_data(data_root)
+        self._require_model().load_data(data_root)
 
-    def calc_lens(self, data_path: str, jsonl_name: str, do_replace: bool = False,
-                  checkpoint_path: str | None = None, run_name: str | None = None,
-                  dim_batch: int = 32, MAX_SEQ_LEN: int = 300, checkpoint_every: int = 5,
-                  is_test: bool = False):
+    def calc_lens(
+        self,
+        data_path: str,
+        jsonl_name: str,
+        do_replace: bool = False,
+        mode: str | None = None,
+        checkpoint_path: str | None = None,
+        run_name: str | None = None,
+        dim_batch: int = 32,
+        MAX_SEQ_LEN: int = 300,
+        checkpoint_every: int = 5,
+        is_test: bool = False
+        ):
         """
         * Calculates Jlens for the specified model using data in the given data_path.
-        * If run_name is specified, the function ignores the path and looks for it in ~/Jlens/lens_checkpoints/*name*
+        * If run_name is specified, the function ignores the path and looks for it in output/checkpoints/*name*/lens.pt
         * If a checkpoint named *run_name* is already in there, automatically try run_name_1 or more.
         * If more than 10 is present, it'll be named as *run_name*_1919810😢.
         * Replaces the original if replace = True is specified.
@@ -36,28 +51,29 @@ class Jlens(l.Lens):
         """
         import parser
         parser = parser.Parser()
+        model = self._require_model()
     
         jsonl_path = os.path.abspath(os.path.join(data_path, jsonl_name))
         self._load_data(data_path)
         self.logger.info("Loading metadata from %s", jsonl_path)
         records = parser.load_jsonl_lines(jsonl_path)
-        if is_test: records = [records[0]]    
+        if is_test: records = [records[i] for i in range(min(5, len(records)))]
         self.logger.info("Loaded %d samples", len(records))
         print("Loaded %d samples", len(records))
     
         self.logger.info("Filtering samples by length (max_seq_len=%d) before fitting...", MAX_SEQ_LEN)
-        records = process_audio(
+        records, prompt_len, text_len = process_audio(
             records = records,
             logger = self.logger,
-            processor=self.model.processor,
+            processor=model.processor,
             data_root=data_path,
-            sampling_rate=self.model.sampling_rate,
+            sampling_rate=model.sampling_rate,
             max_length=MAX_SEQ_LEN,
         )
         if not records:
             raise ValueError("長度過濾後沒有剩下任何樣本，請檢查 max_seq_len 設定或資料本身。Exiting...")
     
-        n_layers = self.model.n_layers  # 應為 32
+        n_layers = model.n_layers  # 應為 32
         source_layers = list(range(n_layers - 1))  # 0..30，共 31 層
         target_layer = n_layers - 1  # 31
         
@@ -71,10 +87,13 @@ class Jlens(l.Lens):
             "dim_batch=%d, max_seq_len=%d, checkpoint_every=%d, checkpoint_path=%s",
             dim_batch, MAX_SEQ_LEN, checkpoint_every, checkpoint_path,
         )
-    
-        self.lens = jlens_fit(
-            model=self.model,
+        
+        self.lens = subset_fit(
+            model=model,
             prompts=records,
+            prompt_len=prompt_len,
+            text_len=text_len,
+            mode=mode,
             source_layers=source_layers,
             target_layer=target_layer,
             dim_batch=dim_batch,
@@ -86,31 +105,19 @@ class Jlens(l.Lens):
         self.logger.info("fitting finished. %r", self.lens)
         self.logger.info("Saving lens...")
 
-        save_dir = ""
-        if run_name is not None:
-            save_directory_dir = os.path.join(os.getcwd(), "Jlens", "lens_checkpoints")
-            save_dir = os.path.join(save_directory_dir, run_name)
-            if not do_replace and os.path.exists(save_dir):
-                save_success = False
-                for i in range(10):
-                    if not os.path.exists(os.path.join(save_directory_dir, run_name + f"_{i}")):
-                        self.logger.warning(f"File {save_dir} already exists. Saving as {run_name}_{i}")
-                        save_dir = os.path.join(save_directory_dir, run_name + f"_{i}")
-                        save_success = True
-                        break
-                if not save_success:
-                    self.logger.error(f"File {save_dir} have 10+ checkpoint with the same name. Check your code 😭.")
-                    save_dir = os.path.join(save_directory_dir, run_name + f"_{1919810}")
-        elif checkpoint_path is not None:
-            save_dir = checkpoint_path  
+        if checkpoint_path is not None:
+            # Keep the resumable fit checkpoint and final lens together by task.
+            save_dir = os.path.join(os.path.dirname(checkpoint_path), "lens.pt")
+        elif run_name is not None:
+            save_dir = os.path.join(os.getcwd(), "output", "checkpoints", run_name, "lens.pt")
         else:
             from random import choices
             from string import digits, ascii_uppercase
 
             alphabet = digits + ascii_uppercase
             name = ''.join(choices(alphabet, k=16))
-            self.logger.warning(f"No checkpoint path or name specified in calc_lens. Saving as {name} to lens_checkpoints.")
-            save_dir = os.path.join(os.getcwd(), "Jlens", "lens_checkpoints", name)
+            self.logger.warning(f"No checkpoint path or name specified in calc_lens. Saving as {name} to output/checkpoints.")
+            save_dir = os.path.join(os.getcwd(), "output", "checkpoints", name, "lens.pt")
         
         parent = os.path.dirname(save_dir)
         if parent:
@@ -146,12 +153,13 @@ class Jlens(l.Lens):
         if data_root is not None:
             self._load_data(data_root)
 
+        model = self._require_model()
         run_layers = []
         if layers_available is None:
             if do_activate_Jacobian:
-                run_layers = list(range(self.model.n_layers - 1))
+                run_layers = list(range(model.n_layers - 1))
             else:
-                run_layers = list(range(self.model.n_layers))
+                run_layers = list(range(model.n_layers))
         else:
             run_layers = layers_available
         
@@ -159,7 +167,7 @@ class Jlens(l.Lens):
             raise ValueError("Missing Json line.")
         
         lens_logits, model_logits, input_ids = self.lens.apply(
-            model= self.model,
+            model=model,
             prompt= json_line,
             layers= run_layers,
             positions= positions,
@@ -196,10 +204,12 @@ class Jlens(l.Lens):
                 
     def load_lens(self, path: str | None = None, name: str | None = None):
         """
-        * If name is specified, the function ignores the path and looks for it in ~/Jlens/lens_checkpoints/*name*
+        * If name is specified, the function ignores the path and looks for it in output/checkpoints/*name*/lens.pt
         """
         if name is not None:
-            checkpoint_path = os.path.join(os.getcwd(), "Jlens", "lens_checkpoints", name)
+            checkpoint_path = os.path.join(
+                os.getcwd(), "output", "checkpoints", name, "lens.pt"
+            )
         elif path is not None:
             checkpoint_path = path
         else:
@@ -211,13 +221,20 @@ class Jlens(l.Lens):
         except Exception as e:
             raise RuntimeError(f"Failed loading lens from {checkpoint_path}({e}).")
 
-# TODO: Decide on a default value for max_length! Require testing on a physical device.
-def process_audio(records, processor, logger: logging.Logger, data_root: str, sampling_rate: int, max_length: int):
+# TODO: Move this to parser
+def process_audio(
+    records: list[str],
+    processor,
+    logger: logging.Logger,
+    data_root: str,
+    sampling_rate: int,
+    max_length: int
+    ) -> tuple[list[str], list[int], list[int]]:
     """
     * Processes the audio.
     * Filters all samples with length(after encoding) longer than max_length
     """
-    kept, dropped = [], []
+    kept, prompt_len, text_len, dropped = [], [], [], []
     for line in records:
         record = json.loads(line)
         audio_rel = record.get("audio_path")
@@ -226,7 +243,7 @@ def process_audio(records, processor, logger: logging.Logger, data_root: str, sa
             logger.warning("跳過缺少欄位的樣本：%s", record.get("id", "<unknown>"))
             dropped.append(record.get("id", "<unknown>"))
             continue
-
+        
         try:
             audio_array, _ = librosa.load(os.path.join(data_root, audio_rel), sr=sampling_rate)
         except Exception as e:
@@ -243,6 +260,22 @@ def process_audio(records, processor, logger: logging.Logger, data_root: str, sa
             return_tensors="pt",
         )
         length = inputs["input_ids"].shape[1]
+        audio_eos = "<|audio_eos|>"
+        if audio_eos not in prompt:
+            logger.warning(
+                "樣本 %s 的 prompt 缺少 %s，無法定位文字 token",
+                record.get("id", "<unknown>"),
+                audio_eos,
+            )
+            text_token_count = 0
+            continue
+        text_prompt = prompt.split(audio_eos, 1)[1]
+        text_inputs = processor.tokenizer(
+            text_prompt,
+            add_special_tokens=False,
+            return_tensors="pt",
+        )
+        text_token_count = text_inputs["input_ids"].shape[1]
         if length > max_length:
             logger.warning(
                 "跳過樣本 %s：長度 %d 超過 max_length=%d",
@@ -251,10 +284,12 @@ def process_audio(records, processor, logger: logging.Logger, data_root: str, sa
             dropped.append(record.get("id", "<unknown>"))
         else:
             kept.append(line)
+            prompt_len.append(length)
+            text_len.append(text_token_count)
 
     logger.info(
         "長度過濾完成：保留 %d / %d 筆%s",
         len(kept), len(records),
         f"，捨棄: {dropped}" if dropped else "",
     )
-    return kept
+    return kept, prompt_len, text_len

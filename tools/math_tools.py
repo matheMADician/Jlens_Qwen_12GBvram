@@ -101,10 +101,16 @@ def cka_similarity(
 def draw_heatmap(
     data: Tensor,
     png_path: str,
-    labels: Sequence[int] | None = None,
-    x_labels: Sequence[int] | None = None,
-    y_labels: Sequence[int] | None = None,
+    labels: Sequence[int | str] | None = None,
+    x_labels: Sequence[int | str] | None = None,
+    y_labels: Sequence[int | str] | None = None,
     title: str = "Layer cosine similarity",
+    x_axis_label: str = "Layer",
+    y_axis_label: str = "Layer",
+    colorbar_label: str = "Cosine similarity",
+    cmap: str = "coolwarm",
+    vmin: float | None = -1.0,
+    vmax: float | None = 1.0,
 ) -> None:
     """Save a two-dimensional tensor as a heatmap image.
 
@@ -115,6 +121,11 @@ def draw_heatmap(
         x_labels: Optional labels for the horizontal axis.
         y_labels: Optional labels for the vertical axis.
         title: Figure title.
+        x_axis_label: Horizontal axis label.
+        y_axis_label: Vertical axis label.
+        colorbar_label: Label for the color scale.
+        cmap: Matplotlib colormap name.
+        vmin, vmax: Optional color scale limits.
     """
     if data.ndim != 2:
         raise ValueError(f"Heatmap data must be 2-D, got shape {tuple(data.shape)}")
@@ -137,19 +148,19 @@ def draw_heatmap(
     figure, axis = plt.subplots(figsize=(8, 6))
     image = axis.imshow(
         data.detach().cpu().numpy(),
-        cmap="coolwarm",
-        vmin=-1.0,
-        vmax=1.0,
+        cmap=cmap,
+        vmin=vmin,
+        vmax=vmax,
         aspect="auto",
     )
     axis.set_title(title)
-    axis.set_xlabel("Layer")
-    axis.set_ylabel("Layer")
+    axis.set_xlabel(x_axis_label)
+    axis.set_ylabel(y_axis_label)
     if x_labels is not None:
         axis.set_xticks(range(len(x_labels)), labels=[str(label) for label in x_labels])
     if y_labels is not None:
         axis.set_yticks(range(len(y_labels)), labels=[str(label) for label in y_labels])
-    figure.colorbar(image, ax=axis, label="Cosine similarity")
+    figure.colorbar(image, ax=axis, label=colorbar_label)
     figure.tight_layout()
     figure.savefig(png_path, dpi=200)
     plt.close(figure)

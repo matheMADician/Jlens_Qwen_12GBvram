@@ -13,7 +13,6 @@ class Master:
             MODEL_ID= self.settings["model"]["id"])
         self.run_name = run_name
 
-    # *可以跑*
     def test_inference(self):
         data_root = self.settings["data"]["root"]
         jsonl_path = self.settings["inference"]["jsonl_path"]
@@ -51,7 +50,6 @@ class Master:
         print(f"下一個 token 候選：{top_tokens}")
         return logits
 
-    # *可以跑*
     def test_training(self):
         if not self.run_name:
             raise ValueError("test_training() 需要提供 --run-name")
@@ -68,10 +66,10 @@ class Master:
             jsonl_path= self.settings["data"]["jsonl_path"],
             checkpoint_save_path= checkpoint_path,
             run_name= self.run_name,
+            mode= None,
             is_test=True,
         )
     
-    # *可以跑*
     def test_lens(self):
         data_root = self.settings["data"]["root"]
         jsonl_path = self.settings["data"]["jsonl_path"]
@@ -103,8 +101,17 @@ class Master:
         
         print(f"Success! Logits: {logits}")
 
-    # *可以跑*
-    def calc_JLens(self):
+    def calc_JLens(self, mode: str | None = None):
+        """Calls the model's fit_Jlens method to calculate JLens and save it to a checkpoint.
+        
+        Args:
+            mode: Defines the source and target tokens for Jacobian matrix calculation.
+                Can be one of the following:
+                - "S2T"
+                - "T2T"
+                - "S&T2T"
+                - "None" (Will use ordinary fit_jlens() function)
+        """
         checkpoint_root = self.settings["checkpoints"]["root"]
         checkpoint_name = self.run_name or "default"
         checkpoint_directory = os.path.join(checkpoint_root, checkpoint_name)
@@ -114,22 +121,42 @@ class Master:
         self.model.fit_Jlens(
             jsonl_path= self.settings["data"]["jsonl_path"],
             checkpoint_save_path=checkpoint_path,
-            run_name= self.run_name
+            run_name= self.run_name,
+            mode= mode
         )
 
-    def apply_Jlens(self):
+    def ablation(self):
+        #TODO
+        return
+        jlens_path = self.settings["ablation"]["lens_path"]
+        self.model.load_Jlens(lens_path= jlens_path)
+        
+        selected_layers
+        token_positions
+        heatmap_path
+        
+
+    def apply_Jlens(
+        self,
+        lens_path: str
+        ):
         self.inference_jsonl_path = self.settings["inference"]["jsonl_path"]
         json_lines = self.parser.load_jsonl_lines(self.inference_jsonl_path)
-        jlens_path = self.settings["checkpoints"]["load_path"]
+        jlens_path = lens_path
         self.model.load_Jlens(lens_path= jlens_path)
+        task_name = self.run_name or "default"
+        task_output = os.path.join(
+            self.settings["inference"]["output_root"], task_name
+        )
+        os.makedirs(task_output, exist_ok=True)
         for i in range(len(json_lines)):
             self.model.apply_lens(
                 json_line = json_lines[i],
                 data_root= self.settings["data"]["root"],
-                save_path= self.settings["inference"]["output_root"],
+                save_path= task_output,
                 top_k= self.settings["inference"]["top_k"],
                 use_Jlens= True,
-                run_name= self.run_name,
+                run_name= task_name,
             )
     
     def comp_dataset_choice(self):
@@ -138,7 +165,6 @@ class Master:
     
     def draw_Jlens_heatmap(
         self,
-        heatmap_path: str,
         lens_path1: str,
         lens_path2: str | None = None,
     ) -> torch.Tensor:
@@ -152,9 +178,15 @@ class Master:
             lens_path1 (str): Path to the Jlens checkpoint.
             lens_path2 (str | None, optional): If not specified, compare lens1 to itself.
         """
-        lens1 = Jlens(self.logger, self.model.model)
+        heatmap_path = os.path.join(
+            self.settings["inference"]["heatmap_path"],
+            self.run_name or "default",
+        )
+        os.makedirs(heatmap_path, exist_ok=True)
+        
+        lens1 = Jlens(self.logger)
         lens1.load_lens(path=lens_path1)
-        lens2 = lens1 if lens_path2 is None else Jlens(self.logger, self.model.model)
+        lens2 = lens1 if lens_path2 is None else Jlens(self.logger)
         if lens_path2 is not None:
             lens2.load_lens(path=lens_path2)
 
@@ -173,18 +205,48 @@ class Master:
         )
         draw_heatmap(
             data=heatmap,
-            png_path=os.path.join(heatmap_path, self.run_name),
+            png_path=os.path.join(heatmap_path, self.run_name or "heatmap"),
             x_labels=layers2,
             y_labels=layers1,
             title="JLens Jacobian cosine similarity",
         )
         self.logger.info("Saved JLens heatmap to %s", heatmap_path)
         return heatmap
+
+    def draw_Jlens_svd_heatmaps(
+        self,
+        lens_path: str,
+        top_k: int | None = None,
+        device: str = "cpu",
+    ) -> tuple[str, str]:
+        """Save per-layer singular spectra and adjacent-layer subspace heatmaps."""
+        if top_k is None:
+            top_k = int(self.settings["matrix_analysis"]["SVD_top_k"])
+        output_dir = os.path.join(
+            self.settings["inference"]["heatmap_path"],
+            "SVD_analysis",
+            self.run_name or "default",
+        )
+        lens = Jlens(self.logger)
+        lens.load_lens(path=lens_path)
+        assert lens.lens is not None
+
+        from tools.matrix_tools import draw_svd_heatmaps
+
+        paths = draw_svd_heatmaps(
+            jacobians=lens.lens.jacobians,
+            output_dir=output_dir,
+            name=self.run_name or "jlens",
+            top_k=top_k,
+            device=device,
+        )
+        self.logger.info("Saved JLens SVD heatmaps to %s", output_dir)
+        return paths
     
     def comp_Jlens(self, lens_path1, lens_path2):
         # Compares two Jlens
-        Jlens1= Jlens(self.logger, self.model.model)
-        Jlens2= Jlens(self.logger, self.model.model)
+        Jlens1= Jlens(self.logger)
+        Jlens2= Jlens(self.logger)
         
         Jlens1.load_lens(lens_path1)
         Jlens2.load_lens(lens_path2)

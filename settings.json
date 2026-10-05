@@ -5,19 +5,23 @@
     },
     "data": {
         "root": "data",
-        "jsonl_path": "data/esc50-50_fleurs_en_us-50.jsonl"
+        "jsonl_path": "data/esc50-50_libri-50.jsonl"
     },
     "training": {
         "max_seq_len": 300
     },
     "checkpoints": {
-        "root": "Jlens/checkpoints",
-        "load_path": "Jlens/lens_checkpoints/esc50-50_fleurs_en_us-50"
+        "root": "output/checkpoints",
+        "load_path": "output/checkpoints/esc50-50_+_libri-50/lens.pt"
+    },
+    "matrix_analysis": {
+        "SVD_top_k": 8
     },
     "inference": {
         "jsonl_path": "data/prompts.jsonl",
         "max_length": 300,
-        "output_root": "model/inference",
+        "output_root": "output/inference",
+        "heatmap_path": "output/heatmaps",
         "test_jsonl_path": "data/for_inference.jsonl",
         "top_k": 5
     }
