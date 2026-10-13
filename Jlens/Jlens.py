@@ -13,7 +13,7 @@ class Jlens(l.Lens):
     """
     def __init__(self, logger: logging.Logger, model: Instance | None = None):
         self.model = model
-        self.lens = None
+        self.lens: JacobianLens | None = None
         self.logger = logger
 
     def _require_model(self) -> Instance:
@@ -221,7 +221,12 @@ class Jlens(l.Lens):
         except Exception as e:
             raise RuntimeError(f"Failed loading lens from {checkpoint_path}({e}).")
 
-# TODO: Move this to parser
+    def get_J_vector(self, layer: int, token: int):
+        assert self.lens is not None
+        if token > self.lens.jacobians[layer].shape[0]:
+            raise ValueError(f"Token index {token} exceeds model dimension {self.lens.jacobians[layer].shape[0]}")
+        return self.lens.jacobians[layer][token]
+
 def process_audio(
     records: list[str],
     processor,

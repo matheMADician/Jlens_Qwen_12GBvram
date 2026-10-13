@@ -2,6 +2,7 @@ from Jlens import lens, Jlens as J, LogitLens as L
 from model import instance as Inst
 import os, logging
 import json
+import torch
 
 class Model:
     """
@@ -168,7 +169,84 @@ class Model:
                 self.encode_prompt(jsonl_line, MAX_LENGTH=MAX_LENGTH)
             )
         )
-            
+         
+    def _token_directions(self, token_id: int, layers: list[int]) -> dict[int, torch.Tensor]:
+        """
+        * Unit direction of token_id in the residual space of each layer: d_l = J_l^T u,
+          where u is the token's unembedding row scaled by the final norm weight.
+        * Moving a residual along d_l changes the lens logit of that token.
+        """
+        jacobian_lens = getattr(self.lens, "lens", None)
+        if not isinstance(self.lens, J.Jlens) or jacobian_lens is None:
+            raise RuntimeError("J-vector ablation needs a Jlens. Call fit_Jlens() / load_Jlens() first.")
+        missing = sorted(set(layers) - set(jacobian_lens.source_layers))
+        if missing:
+            raise ValueError(f"layers {missing} are not in the lens source_layers.")
+
+        instance = self.load_model()
+        unembed_row = instance.hf_model.lm_head.weight[token_id].float()
+        unembed_row = unembed_row * instance.LALM_model.language_model.norm.weight.float()
+        directions = {}
+        for layer in layers:
+            jacobian = jacobian_lens.jacobians[layer].to(unembed_row.device, torch.float32)
+            direction = unembed_row @ jacobian
+            directions[layer] = direction / direction.norm().clamp_min(1e-8)
+        return directions
+
+    def run_ablation_inference(
+        self,
+        jsonl_line: str,
+        data_root: str,
+        mode: str,
+        layers: list[int],
+        token_pos: list[int],
+        target_token: int | None = None,
+        beta: float | None = None,
+        target_token2: int | None = None,
+        read_positions: list[int] | None = None,
+        MAX_LENGTH: int = 300,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        * Returns (baseline_logits, ablated_logits), each [len(read_positions), vocab] on the CPU.
+        * read_positions defaults to the last position. Python indexing, negatives allowed.
+        * token_pos: positions whose residual is modified, at every layer in layers.
+        * Modes:
+            - "ablation":  set the residual to zero.
+            - "jablation": remove the target_token J-vector component. beta=1 removes it (default), beta=2 reverses it.
+            - "injection": do jablation(beta=1) on target_token, then add the removed magnitude along target_token2.
+        """
+        if mode in ("jablation", "injection") and target_token is None:
+            raise ValueError(f"mode={mode!r} requires target_token.")
+        if mode == "injection" and target_token2 is None:
+            raise ValueError("mode='injection' requires target_token2.")
+
+        directions = directions2 = None
+        if target_token is not None and mode in ("jablation", "injection"):
+            directions = self._token_directions(target_token, layers)
+        if target_token2 is not None and mode == "injection":
+            directions2 = self._token_directions(target_token2, layers)
+
+        spec = Inst.AblationSpec(
+            mode=mode,
+            layers=layers,
+            token_pos=token_pos,
+            directions=directions,
+            beta=1.0 if beta is None else beta,
+            directions2=directions2,
+        )
+
+        instance = self.load_model()
+        instance.load_data(data_root=data_root)
+        input_ids = self.encode_prompt(jsonl_line, MAX_LENGTH=MAX_LENGTH)
+        read = [-1] if read_positions is None else read_positions
+
+        def logits_at(residual: torch.Tensor) -> torch.Tensor:
+            return instance.unembed(residual[0][read]).float().cpu()
+
+        baseline = logits_at(instance.ablation_forward(input_ids))
+        ablated = logits_at(instance.ablation_forward(input_ids, spec))
+        return baseline, ablated
+
 
 import csv
 from pathlib import Path

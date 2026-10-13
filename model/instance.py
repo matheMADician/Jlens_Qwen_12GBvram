@@ -6,6 +6,48 @@ from transformers import Qwen2AudioForConditionalGeneration, AutoProcessor, Bits
 
 logger = logging.getLogger(__name__)
 
+ABLATION_MODES = ("ablation", "jablation", "injection")
+
+
+class AblationSpec:
+    """
+    Tensor-only description of a residual-stream intervention.
+    Directions are computed by the caller (see Model), so Instance never
+    depends on a lens.
+
+    * ablation:  set the residual to zero.
+    * jablation: h -> h - beta * (h . d) d. beta=1 removes the component, beta=2 reverses it.
+    * injection: h -> h - (h . d) d + (h . d) d2.
+    ``directions`` / ``directions2`` map layer -> unit vector of shape [d_model].
+    """
+    def __init__(
+        self,
+        mode: str,
+        layers: list[int],
+        token_pos: list[int],
+        directions: dict[int, torch.Tensor] | None = None,
+        beta: float = 1.0,
+        directions2: dict[int, torch.Tensor] | None = None,
+    ):
+        if mode not in ABLATION_MODES:
+            raise ValueError(f"Unknown ablation mode {mode!r}; expected one of {ABLATION_MODES}")
+        if mode != "ablation" and directions is None:
+            raise ValueError(f"mode={mode!r} requires directions.")
+        if mode == "injection" and directions2 is None:
+            raise ValueError("mode='injection' requires directions2.")
+        for name, table in (("directions", directions), ("directions2", directions2)):
+            if table is not None:
+                missing = sorted(set(layers) - set(table))
+                if missing:
+                    raise ValueError(f"{name} is missing layers {missing}.")
+        self.mode = mode
+        self.layers = list(layers)
+        self.token_pos = list(token_pos)
+        self.directions = directions
+        self.beta = beta
+        self.directions2 = directions2
+
+
 class Instance(LensModel):
     """
     Qwen2-Audio 的 adapter，給 JLens 使用。
@@ -149,6 +191,71 @@ class Instance(LensModel):
             use_cache=False,
         )
         return outputs.last_hidden_state
+
+    def ablation_forward(
+        self,
+        input_ids: torch.Tensor,
+        ablation_spec: AblationSpec | None = None,
+    ) -> torch.Tensor:
+        """
+        * Runs forward() with the ablation applied to the output of each block in ablation_spec.layers.
+        * Returns the final block's residual (before the final norm), which unembed() maps to logits.
+          This matches the model logits used by JacobianLens.apply().
+        * ablation_spec=None gives the unmodified baseline.
+        """
+        final_layer = self.n_layers - 1
+        captured: dict[str, torch.Tensor] = {}
+        handles = []
+
+        def _capture(module, inputs, output):
+            captured["residual"] = (output if torch.is_tensor(output) else output[0]).detach()
+
+        try:
+            # Ablation hooks must be registered before the capture hook so that
+            # ablating the last layer is visible to it.
+            if ablation_spec is not None:
+                for layer in ablation_spec.layers:
+                    if not 0 <= layer < self.n_layers:
+                        raise ValueError(f"layer {layer} out of range for a {self.n_layers}-layer model")
+                    handles.append(
+                        self.layers[layer].register_forward_hook(
+                            self._make_ablation_hook(layer, ablation_spec)
+                        )
+                    )
+            handles.append(self.layers[final_layer].register_forward_hook(_capture))
+            with torch.no_grad():
+                self.forward(input_ids)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+        return captured["residual"]
+
+    @staticmethod
+    def _make_ablation_hook(layer: int, spec: AblationSpec):
+        def hook(module, inputs, output):
+            hidden = output if torch.is_tensor(output) else output[0]
+            seq_len = hidden.shape[1]
+            pos = [p % seq_len for p in spec.token_pos]
+            selected = hidden[:, pos, :].float()
+
+            if spec.mode == "ablation":
+                new = torch.zeros_like(selected)
+            else:
+                assert spec.directions is not None
+                d = spec.directions[layer].to(selected.device, torch.float32)
+                coeff = (selected @ d).unsqueeze(-1)
+                if spec.mode == "jablation":
+                    new = selected - spec.beta * coeff * d
+                else:
+                    assert spec.directions2 is not None
+                    d2 = spec.directions2[layer].to(selected.device, torch.float32)
+                    new = selected - coeff * d + coeff * d2
+
+            patched = hidden.clone()
+            patched[:, pos, :] = new.to(hidden.dtype)
+            return patched if torch.is_tensor(output) else (patched, *output[1:])
+        return hook
 
     def unembed(self, residual: torch.Tensor) -> torch.Tensor:
         """
