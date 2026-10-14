@@ -89,15 +89,33 @@ Master.py
 
 ## 資料格式
 
-目前 JLens 的輸入是 JSONL。每行至少需要包含：
+`data/get_data.py` 輸出的 JSONL 使用模型無關的 `messages` 對話格式，
+並以相對於 dataset 根目錄的路徑引用音訊：
 
 ```json
 {
   "id": "sample-001",
   "audio_path": "audio/sample.wav",
-  "prompt": "請描述這段音訊的內容。"
+  "messages": [
+    {
+      "role": "user",
+      "content": [
+        {"type": "audio", "path": "audio/sample.wav"},
+        {"type": "text", "text": "Dataset-provided instruction"}
+      ]
+    }
+  ]
 }
 ```
+
+`--prompt-column` 可指定 user message 使用的 dataset prompt 欄位；若未指定，
+user message 的文字內容會是空字串。這樣可供後續 LLM 填入 prompt。
+`--transcription` 指定頂層 `transcript` 欄位來源，會自動偵測常見的
+`transcription`、`raw_transcription` 或 `transcript` 欄位。這和 prompt 欄位用途不同，
+也避免自動把 emotion、gender 等分類標籤當作回答。
+逐字稿只存在頂層 `transcript`，不會放進 `messages` 的 assistant 內容。
+產生器保留頂層 `transcript` 欄位供目前的 model loader 使用，標準新格式以
+`messages` 為準。
 
 建議資料集結構如下：
 
@@ -121,7 +139,7 @@ python data/get_data.py \
   --split train \
   --target 100 \
   --output data/fleurs_en_us \
-  --text-column transcription \
+  --transcription transcription \
   --overwrite
 ```
 

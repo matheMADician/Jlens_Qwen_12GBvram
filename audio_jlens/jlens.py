@@ -1,11 +1,9 @@
-from jlens.fitting import fit as jlens_fit
 from jlens.lens import JacobianLens
-import os, json, librosa, logging
-from Jlens import lens as l
-from Jlens.Subset_fitting import subset_fit
+import os, logging
+from audio_jlens import lens as l
+from audio_jlens.subset_fitting import subset_fit
 from model.instance import Instance
-
-#TODO update the fit function for subset fitting
+from json_parser import Parser
 
 class Jlens(l.Lens):
     """
@@ -15,6 +13,17 @@ class Jlens(l.Lens):
         self.model = model
         self.lens: JacobianLens | None = None
         self.logger = logger
+
+    def init_zero(self):
+        """Initialize the lens to zero."""
+        if self.lens is not None:
+            raise RuntimeError("Lens is already initialized.")
+        
+        self.lens = JacobianLens(
+            jacobians={},
+            n_prompts=0,
+            d_model=self._require_model().d_model,
+        )
 
     def _require_model(self) -> Instance:
         if self.model is None:
@@ -27,56 +36,49 @@ class Jlens(l.Lens):
         if not data_root:
             raise ValueError("No data root passed to Jlens.")
         self._require_model().load_data(data_root)
-
-    def calc_lens(
+ 
+    def calc_lens_batch(
         self,
         data_path: str,
         jsonl_name: str,
-        do_replace: bool = False,
         mode: str | None = None,
         checkpoint_path: str | None = None,
+        checkpoint_every: int = 5,
         run_name: str | None = None,
         dim_batch: int = 32,
         MAX_SEQ_LEN: int = 300,
-        checkpoint_every: int = 5,
-        is_test: bool = False
+        is_test: bool = False,
+        data_root: str | None = None,
         ):
         """
-        * Calculates Jlens for the specified model using data in the given data_path.
+        * This is the basic fitting function.
+        * Calculates Jlens using the JSONL in data_path and audio paths relative
+          to data_root (or data_path when data_root is omitted).
         * If run_name is specified, the function ignores the path and looks for it in output/checkpoints/*name*/lens.pt
         * If a checkpoint named *run_name* is already in there, automatically try run_name_1 or more.
-        * If more than 10 is present, it'll be named as *run_name*_1919810😢.
         * Replaces the original if replace = True is specified.
-        * WARNING: No duplicate protection when full path is specified!!!
+        * No duplicate protection when full path is specified!!!
         """
-        import parser
-        parser = parser.Parser()
+        # Get model
         model = self._require_model()
-    
+        
+        # Load JSONL and audio data
         jsonl_path = os.path.abspath(os.path.join(data_path, jsonl_name))
-        self._load_data(data_path)
+        audio_root = data_root if data_root is not None else data_path
+        self._load_data(audio_root)
         self.logger.info("Loading metadata from %s", jsonl_path)
-        records = parser.load_jsonl_lines(jsonl_path)
+        
+        # Passes the raw JSONL records directly to the parser
+        records = Parser.load_jsonl_lines(jsonl_path)
         if is_test: records = [records[i] for i in range(min(5, len(records)))]
         self.logger.info("Loaded %d samples", len(records))
-        print("Loaded %d samples", len(records))
-    
-        self.logger.info("Filtering samples by length (max_seq_len=%d) before fitting...", MAX_SEQ_LEN)
-        records, prompt_len, text_len = process_audio(
-            records = records,
-            logger = self.logger,
-            processor=model.processor,
-            data_root=data_path,
-            sampling_rate=model.sampling_rate,
-            max_length=MAX_SEQ_LEN,
-        )
-        if not records:
-            raise ValueError("長度過濾後沒有剩下任何樣本，請檢查 max_seq_len 設定或資料本身。Exiting...")
-    
-        n_layers = model.n_layers  # 應為 32
-        source_layers = list(range(n_layers - 1))  # 0..30，共 31 層
-        target_layer = n_layers - 1  # 31
+
+        # The source and target layers for Jlens fitting.
+        n_layers = model.n_layers
+        source_layers = list(range(n_layers - 1))
+        target_layer = n_layers - 1
         
+        # If in test mode, only use the second-to-last layer as the source layer.
         if is_test: source_layers = [n_layers - 2]
     
         self.logger.info(
@@ -88,11 +90,13 @@ class Jlens(l.Lens):
             dim_batch, MAX_SEQ_LEN, checkpoint_every, checkpoint_path,
         )
         
+        # Fit
+        self.logger.info("fitting started. %r", self.lens)
         self.lens = subset_fit(
             model=model,
             prompts=records,
-            prompt_len=prompt_len,
-            text_len=text_len,
+            processor=model.processor,
+            data_root=audio_root,
             mode=mode,
             source_layers=source_layers,
             target_layer=target_layer,
@@ -101,10 +105,10 @@ class Jlens(l.Lens):
             checkpoint_path=checkpoint_path,
             checkpoint_every=checkpoint_every,
         )
-    
         self.logger.info("fitting finished. %r", self.lens)
         self.logger.info("Saving lens...")
 
+        # Rigorously ensuring the lens is actually saved.
         if checkpoint_path is not None:
             # Keep the resumable fit checkpoint and final lens together by task.
             save_dir = os.path.join(os.path.dirname(checkpoint_path), "lens.pt")
@@ -123,18 +127,31 @@ class Jlens(l.Lens):
         if parent:
             os.makedirs(parent, exist_ok=True)
 
+        self.logger.info("Saving lens to %s", save_dir)
+        self.logger.info("*"+"-"*20+"*")
         self.save_lens(path = save_dir)
 
-    #TODO: This is Qwen-specific. Has to be changed to work for more models.
+    def add_prompt(
+        self,
+        
+    ):
+        """
+        * Calculate the Jlens for the single prompt given, filter it using the top_k most significant directions.
+            the same filtering logic as in fitting.py, and adds it to the lens.
+        * Also initilizes the lens if it hasn't been created yet.
+        """
+        from audio_jlens.subset_fitting import subset_jacobian_for_prompt
+        self.init_zero()
+
     def apply_lens(
-            self, 
-            do_activate_Jacobian: bool = True,
-            json_line: str | None = None,
-            layers_available: list[int] | None = None,
-            positions: list[int] | None = None,
-            top_k: int = 5,
-            MAX_SEQ_LEN: int = 300,
-            data_root: str | None = None ):
+        self, 
+        do_activate_Jacobian: bool = True,
+        json_line: str | None = None,
+        layers_available: list[int] | None = None,
+        positions: list[int] | None = None,
+        top_k: int = 5,
+        MAX_SEQ_LEN: int = 300,
+        data_root: str | None = None ):
         """
         * Applies Lens to model. To use LogitLens, use do_activate_Jacobian = False
         * json_line takes raw json data.
@@ -226,75 +243,3 @@ class Jlens(l.Lens):
         if token > self.lens.jacobians[layer].shape[0]:
             raise ValueError(f"Token index {token} exceeds model dimension {self.lens.jacobians[layer].shape[0]}")
         return self.lens.jacobians[layer][token]
-
-def process_audio(
-    records: list[str],
-    processor,
-    logger: logging.Logger,
-    data_root: str,
-    sampling_rate: int,
-    max_length: int
-    ) -> tuple[list[str], list[int], list[int]]:
-    """
-    * Processes the audio.
-    * Filters all samples with length(after encoding) longer than max_length
-    """
-    kept, prompt_len, text_len, dropped = [], [], [], []
-    for line in records:
-        record = json.loads(line)
-        audio_rel = record.get("audio_path")
-        prompt = record.get("prompt")
-        if audio_rel is None or prompt is None:
-            logger.warning("跳過缺少欄位的樣本：%s", record.get("id", "<unknown>"))
-            dropped.append(record.get("id", "<unknown>"))
-            continue
-        
-        try:
-            audio_array, _ = librosa.load(os.path.join(data_root, audio_rel), sr=sampling_rate)
-        except Exception as e:
-            logger.warning("跳過載入失敗的樣本 %s：%s", record.get("id", "<unknown>"), e)
-            dropped.append(record.get("id", "<unknown>"))
-            continue
-        
-        prompt = record["prompt"]
-
-        inputs = processor(
-            text=prompt,
-            audio=[audio_array],
-            sampling_rate=sampling_rate,
-            return_tensors="pt",
-        )
-        length = inputs["input_ids"].shape[1]
-        audio_eos = "<|audio_eos|>"
-        if audio_eos not in prompt:
-            logger.warning(
-                "樣本 %s 的 prompt 缺少 %s，無法定位文字 token",
-                record.get("id", "<unknown>"),
-                audio_eos,
-            )
-            text_token_count = 0
-            continue
-        text_prompt = prompt.split(audio_eos, 1)[1]
-        text_inputs = processor.tokenizer(
-            text_prompt,
-            add_special_tokens=False,
-            return_tensors="pt",
-        )
-        text_token_count = text_inputs["input_ids"].shape[1]
-        if length > max_length:
-            logger.warning(
-                "跳過樣本 %s：長度 %d 超過 max_length=%d",
-                record.get("id", "<unknown>"), length, max_length,
-            )
-            dropped.append(record.get("id", "<unknown>"))
-        else:
-            kept.append(line)
-            prompt_len.append(length)
-            text_len.append(text_token_count)
-
-    logger.info(
-        "長度過濾完成：保留 %d / %d 筆%s",
-        len(kept), len(records),
-        f"，捨棄: {dropped}" if dropped else "",
-    )
-    return kept, prompt_len, text_len

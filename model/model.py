@@ -1,258 +1,11 @@
-from Jlens import lens, Jlens as J, LogitLens as L
-from model import instance as Inst
-import os, logging
-import json
-import torch
-
-class Model:
-    """
-    Master class of all model methods.
-    Loads the model on demand; repeated load_model() calls reuse the same instance.
-    LogitLens is the default. To load Jlens, use load_lens(), and to calculate Jlens, use calc_Jlens().
-    """
-    #TODO: This is Qwen-specific, change this!
-    def __init__(self,
-        logger: logging.Logger,
-        do_4bit: bool = False,
-        MODEL_ID="Qwen/Qwen2-Audio-7B-Instruct"):
-        
-        self.logger = logger
-        self.model_id = MODEL_ID
-        self.do_4bit = do_4bit
-        self.lens: lens.Lens | None = None
-        self._model: Inst.Instance | None = None
-        self.lens_cache = LensOutputCache()
-
-    def load_model(self) -> Inst.Instance:
-        """Load the model once, reusing it on subsequent calls."""
-        if self._model is None:
-            model = Inst.Instance(
-                MODEL_ID=self.model_id,
-                do_4bit=self.do_4bit,
-            )
-            self._model = model
-            self.lens_cache.tokenizer = model.tokenizer
-        return self._model
-
-    @property
-    def model(self) -> Inst.Instance:
-        return self.load_model()
-
-    @property
-    def hf_model(self):
-        return self.load_model().hf_model
-
-    @property
-    def processor(self):
-        return self.load_model().processor
-
-    def get_model(self):
-        model = self.load_model()
-        return model, model.processor
-
-    def get_model_info(self):
-        #TODO
-        pass
-
-    def load_Jlens(self, lens_path: str | None = None, lens_name: str | None = None):
-        """
-        * If name is specified, the function ignores the path and looks for it in output/checkpoints/*name*/lens.pt
-        """
-        self.lens = J.Jlens(logger=self.logger)
-        self.lens.load_lens(path= lens_path, name= lens_name)
-        self.lens_cache.clear_jlens()
-
-    def fit_Jlens(
-            self, jsonl_path: str,
-            dim_batch: int = 32,
-            checkpoint_interval: int = 5,
-            MAX_SEQ_LEN: int = 300,
-            do_replace: bool = False,
-            mode: str | None = None,
-            checkpoint_save_path: str | None = None,
-            run_name: str | None = None,
-            is_test: bool = False
-            ):
-        """
-        * Calls the calc_lens() function in Jlens.
-        * See ~/Jlens/Jlens.py for detail.
-        * jsonl_path accepts the relative path to jsonl files.
-        * WARNING: This cleans the cache.
-        * Your structure should look like this:
-        * *parent directory*/jsonl_file
-        * *parent directory*/audio_path_in_jsonl
-        """
-        # Parse the jsonl_path into data path(parent directory) and jsonl name
-        if not os.path.isfile(jsonl_path):
-            raise RuntimeError(f"Jsonl file({jsonl_path}) does not exist.")
-        parent_dir, jsonl_name = os.path.split(jsonl_path)
-
-        model = self.load_model()
-        self.lens = J.Jlens(logger=self.logger, model=model)
-        self.lens.calc_lens(
-            data_path= parent_dir,
-            jsonl_name= jsonl_name,
-            do_replace= do_replace,
-            mode= mode,
-            checkpoint_path= checkpoint_save_path,
-            run_name= run_name,
-            dim_batch= dim_batch,
-            MAX_SEQ_LEN= MAX_SEQ_LEN,
-            checkpoint_every= checkpoint_interval,
-            is_test= is_test
-            )
-        self.lens_cache.clear_jlens()
-
-    def apply_lens(
-            self,
-            json_line: str,
-            data_root: str,
-            run_name: str,
-            save_path: str | None = None,
-            use_Jlens: bool = True,
-            top_k: int = 5,
-            layers_available: list[int] | None = None,
-            MAX_SEQ_LEN: int = 300,
-            ):
-        """
-        * Auto-save the data into model cache.
-        * If save_path is specified, creates and auto-saves into the .csv file.
-        """
-        if self.lens is None and use_Jlens:
-            raise ValueError("No lens in model. Call fit_Jlens() / load_Jlens() first.")
-        model = self.load_model()
-        if self.lens is None:
-            self.lens = L.LogitLens(
-                logger= self.logger,
-                model=model
-            )
-        elif isinstance(self.lens, J.Jlens):
-            self.lens.model = model
-        
-        # Do both Jlens and LogitLens when not testing
-        runs = [True, False] if use_Jlens else [False]
-        for do_activate_Jacobian in runs:
-            result = self.lens.apply_lens(
-                do_activate_Jacobian= do_activate_Jacobian,
-                json_line= json_line,
-                layers_available= layers_available,
-                # TODO: Support selected token positions; save() currently assumes all positions.
-                positions= None,
-                top_k= top_k,
-                MAX_SEQ_LEN= MAX_SEQ_LEN,
-                data_root= data_root
-            )
-            self.lens_cache.put(
-                "jlens" if do_activate_Jacobian else "logit_lens",
-                result,
-            )
-        
-        if save_path is not None:
-            self.lens_cache.save(save_path= save_path, run_name= run_name, top_k= top_k)
-
-    def encode_prompt(self, json_line: str, MAX_LENGTH: int = 300):
-        return self.load_model().encode(text=json_line, max_length=MAX_LENGTH)
-        
-    def run_inference(
-        self,
-        jsonl_line: str,
-        data_root: str,
-        MAX_LENGTH: int = 300,
-    ):
-        """
-        * Returns the last hidden state
-        """
-        model = self.load_model()
-        model.load_data(data_root=data_root)
-        return model.unembed(
-            model.forward(
-                self.encode_prompt(jsonl_line, MAX_LENGTH=MAX_LENGTH)
-            )
-        )
-         
-    def _token_directions(self, token_id: int, layers: list[int]) -> dict[int, torch.Tensor]:
-        """
-        * Unit direction of token_id in the residual space of each layer: d_l = J_l^T u,
-          where u is the token's unembedding row scaled by the final norm weight.
-        * Moving a residual along d_l changes the lens logit of that token.
-        """
-        jacobian_lens = getattr(self.lens, "lens", None)
-        if not isinstance(self.lens, J.Jlens) or jacobian_lens is None:
-            raise RuntimeError("J-vector ablation needs a Jlens. Call fit_Jlens() / load_Jlens() first.")
-        missing = sorted(set(layers) - set(jacobian_lens.source_layers))
-        if missing:
-            raise ValueError(f"layers {missing} are not in the lens source_layers.")
-
-        instance = self.load_model()
-        unembed_row = instance.hf_model.lm_head.weight[token_id].float()
-        unembed_row = unembed_row * instance.LALM_model.language_model.norm.weight.float()
-        directions = {}
-        for layer in layers:
-            jacobian = jacobian_lens.jacobians[layer].to(unembed_row.device, torch.float32)
-            direction = unembed_row @ jacobian
-            directions[layer] = direction / direction.norm().clamp_min(1e-8)
-        return directions
-
-    def run_ablation_inference(
-        self,
-        jsonl_line: str,
-        data_root: str,
-        mode: str,
-        layers: list[int],
-        token_pos: list[int],
-        target_token: int | None = None,
-        beta: float | None = None,
-        target_token2: int | None = None,
-        read_positions: list[int] | None = None,
-        MAX_LENGTH: int = 300,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
-        * Returns (baseline_logits, ablated_logits), each [len(read_positions), vocab] on the CPU.
-        * read_positions defaults to the last position. Python indexing, negatives allowed.
-        * token_pos: positions whose residual is modified, at every layer in layers.
-        * Modes:
-            - "ablation":  set the residual to zero.
-            - "jablation": remove the target_token J-vector component. beta=1 removes it (default), beta=2 reverses it.
-            - "injection": do jablation(beta=1) on target_token, then add the removed magnitude along target_token2.
-        """
-        if mode in ("jablation", "injection") and target_token is None:
-            raise ValueError(f"mode={mode!r} requires target_token.")
-        if mode == "injection" and target_token2 is None:
-            raise ValueError("mode='injection' requires target_token2.")
-
-        directions = directions2 = None
-        if target_token is not None and mode in ("jablation", "injection"):
-            directions = self._token_directions(target_token, layers)
-        if target_token2 is not None and mode == "injection":
-            directions2 = self._token_directions(target_token2, layers)
-
-        spec = Inst.AblationSpec(
-            mode=mode,
-            layers=layers,
-            token_pos=token_pos,
-            directions=directions,
-            beta=1.0 if beta is None else beta,
-            directions2=directions2,
-        )
-
-        instance = self.load_model()
-        instance.load_data(data_root=data_root)
-        input_ids = self.encode_prompt(jsonl_line, MAX_LENGTH=MAX_LENGTH)
-        read = [-1] if read_positions is None else read_positions
-
-        def logits_at(residual: torch.Tensor) -> torch.Tensor:
-            return instance.unembed(residual[0][read]).float().cpu()
-
-        baseline = logits_at(instance.ablation_forward(input_ids))
-        ablated = logits_at(instance.ablation_forward(input_ids, spec))
-        return baseline, ablated
-
-
-import csv
+import os, logging, json, csv
 from pathlib import Path
 import torch
 from torch import Tensor
 
+from audio_jlens import jlens as J, lens, logitLens as L
+from model import instance as Inst
+from jacobian_lens.jlens.lens import JacobianLens
 
 class LensOutputCache:
     """
@@ -470,3 +223,352 @@ class LensOutputCache:
 
     def clear_logit_lens(self):
         self.logit_lens_data = None
+        
+    #TODO
+    def find_token(self, lens: str, token_id: int) -> tuple[list[int], list[int]]:
+        """Find the position where a token appears in the predictions for a specific lens type.
+
+        Args:
+            lens (str): The type of lens to search in ("jlens" or "logit_lens").
+            token_id (int): The ID of the token to find in the predictions.
+
+        Returns:
+            max_posision[layer], :
+                - First list contains the token positions where the token has the highest probability for the given token_id.
+                - The second list contains the highest rank of each token across token positions.
+        """
+        return [], []
+
+class Model:
+    """
+    Master class of all model methods.
+    Loads the model on demand; repeated load_model() calls reuse the same instance.
+    LogitLens is the default. To load Jlens, use load_lens(), and to calculate Jlens, use calc_Jlens().
+    """
+    def __init__(self,
+        logger: logging.Logger,
+        do_4bit: bool = False,
+        MODEL_ID="Qwen/Qwen2.5-Omni-7B"
+        ):
+        
+        self.logger = logger
+        self.model_id = MODEL_ID
+        self.do_4bit = do_4bit
+        # A model is fixed to a single Jlens. fit_Jlens_for_experiment
+        #   will create multiple sub-lens, but only the combined one is binded.
+        self.lens: lens.Lens | None = None
+        self._model: Inst.Instance | None = None
+        self.lens_cache = LensOutputCache()
+
+    def load_model(self) -> Inst.Instance:
+        """Load the model once, reusing it on subsequent calls."""
+        if self._model is None:
+            model = Inst.Instance(
+                MODEL_ID=self.model_id,
+                do_4bit=self.do_4bit,
+            )
+            self._model = model
+            self.lens_cache.tokenizer = model.tokenizer
+        return self._model
+
+    @property
+    def model(self) -> Inst.Instance:
+        return self.load_model()
+
+    @property
+    def hf_model(self):
+        return self.load_model().hf_model
+
+    @property
+    def processor(self):
+        return self.load_model().processor
+
+    def get_model(self):
+        model = self.load_model()
+        return model, model.processor
+
+    def get_lens_output(self) -> LensOutputCache:
+        return self.lens_cache
+
+    def load_Jlens(self, lens_path: str | None = None, lens_name: str | None = None):
+        """
+        * If name is specified, the function ignores the path and looks for it in output/checkpoints/*name*/lens.pt
+        """
+        self.lens = J.Jlens(logger=self.logger)
+        self.lens.load_lens(path= lens_path, name= lens_name)
+        self.lens_cache.clear_jlens()
+ 
+    def fit_Jlens_batch(
+            self, jsonl_path: str,
+            dim_batch: int = 32,
+            checkpoint_interval: int = 5,
+            MAX_SEQ_LEN: int = 300,
+            mode: str | None = None,
+            checkpoint_save_path: str | None = None,
+            run_name: str | None = None,
+            is_test: bool = False,
+            data_root: str | None = None,
+        ):
+        """
+        * Calls the calc_lens() function in Jlens.
+        * See ~/audio_jlens/Jlens.py for detail.
+        * jsonl_path accepts the relative path to jsonl files.
+        * data_root is the root used to resolve audio paths inside each JSONL record.
+          Defaults to the JSONL's parent directory for backwards compatibility.
+        * WARNING: This cleans the cache.
+        * Audio paths in JSONL records are resolved relative to data_root.
+        * jsonl_path is located independently of data_root.
+        """
+        # Parse the jsonl_path into data path(parent directory) and jsonl name
+        if not os.path.isfile(jsonl_path):
+            raise RuntimeError(f"Jsonl file({jsonl_path}) does not exist.")
+        parent_dir, jsonl_name = os.path.split(jsonl_path)
+        audio_root = data_root if data_root is not None else parent_dir
+
+        model = self.load_model()
+        self.lens = J.Jlens(logger=self.logger, model=model)
+        self.lens.calc_lens_batch(
+            data_path= parent_dir,
+            data_root= audio_root,
+            jsonl_name= jsonl_name,
+            mode= mode,
+            checkpoint_path= checkpoint_save_path,
+            run_name= run_name,
+            dim_batch= dim_batch,
+            MAX_SEQ_LEN= MAX_SEQ_LEN,
+            checkpoint_every= checkpoint_interval,
+            is_test= is_test
+            )
+        self.lens_cache.clear_jlens()
+
+    def fit_Jlens_for_experiment(
+        self,
+        jsonl_path: str,
+        seed: int,
+        dim_batch: int = 32,
+        MAX_SEQ_LEN: int = 300,
+        mode: str | None = None,
+        save_prompt_count: list[int] | None = None,
+        checkpoint_save_path: str | None = None,
+        run_name: str | None = None,
+        is_test: bool = False,
+        data_root: str | None = None,
+        checkpoint_interval: int = 5,
+    ) -> tuple[JacobianLens, dict[str, JacobianLens], dict[int, JacobianLens]]:
+        """Fit and save Jacobian lenses for data-size and per-dataset experiments.
+
+        Saves:
+          1. One JacobianLens for each dataset.
+          2. Progressive cumulative JacobianLens snapshots at each milestone count
+             in `save_prompt_count` (e.g. [1, 2, 5, 10, 20, 50, ...]).
+          3. Final combined lens across all processed samples.
+
+        Binds the combined lens to `self.lens`.
+        """
+        from json_parser import Parser
+        from audio_jlens.subset_fitting import subset_fit_experiment
+
+        if not os.path.isfile(jsonl_path):
+            raise RuntimeError(f"Jsonl file({jsonl_path}) does not exist.")
+
+        parent_dir, _ = os.path.split(jsonl_path)
+        audio_root = data_root if data_root is not None else parent_dir
+
+        model = self.load_model()
+        model.load_data(audio_root)
+
+        records_str: list[str] = Parser.load_jsonl_lines(jsonl_path)
+        if is_test:
+            records_str = records_str[: min(5, len(records_str))]
+        self.logger.info("Loaded %d raw sample records from %s", len(records_str), jsonl_path)
+
+        n_layers = model.n_layers
+        source_layers = list(range(n_layers - 1))
+        target_layer = n_layers - 1
+        if is_test:
+            source_layers = [n_layers - 2]
+
+        # Determine output directory
+        if checkpoint_save_path is not None:
+            output_dir = os.path.dirname(checkpoint_save_path)
+            ckpt_file = checkpoint_save_path
+        elif run_name is not None:
+            output_dir = os.path.join(os.getcwd(), "output", "checkpoints", run_name)
+            ckpt_file = os.path.join(output_dir, "fit_checkpoint.pt")
+        else:
+            output_dir = os.path.join(os.getcwd(), "output", "checkpoints", f"experiment_seed_{seed}")
+            ckpt_file = os.path.join(output_dir, "fit_checkpoint.pt")
+
+        os.makedirs(output_dir, exist_ok=True)
+
+        combined_lens, dataset_lenses, milestone_lenses = subset_fit_experiment(
+            model=model,
+            prompts=records_str,
+            seed=seed,
+            mode=mode,
+            save_prompt_counts=save_prompt_count,
+            source_layers=source_layers,
+            target_layer=target_layer,
+            dim_batch=dim_batch,
+            max_seq_len=MAX_SEQ_LEN,
+            output_dir=output_dir,
+            checkpoint_path=ckpt_file,
+            checkpoint_every=checkpoint_interval,
+            resume=os.path.exists(ckpt_file),
+            processor=model.processor,
+            data_root=audio_root,
+        )
+
+        # Bind the combined lens to self.lens
+        jlens_wrapper = J.Jlens(logger=self.logger, model=model)
+        jlens_wrapper.lens = combined_lens
+        self.lens = jlens_wrapper
+        self.lens_cache.clear_jlens()
+
+        return combined_lens, dataset_lenses, milestone_lenses
+
+    def apply_lens(
+            self,
+            json_line: str,
+            data_root: str,
+            run_name: str,
+            save_path: str | None = None,
+            use_Jlens: bool = True,
+            top_k: int = 5,
+            layers_available: list[int] | None = None,
+            MAX_SEQ_LEN: int = 300,
+            ):
+        """
+        * Auto-save the data into model cache.
+        * If save_path is specified, creates and auto-saves into the .csv file.
+        """
+        if self.lens is None and use_Jlens:
+            raise ValueError("No lens in model. Call fit_Jlens() / load_Jlens() first.")
+        model = self.load_model()
+        if self.lens is None:
+            self.lens = L.LogitLens(
+                logger= self.logger,
+                model=model
+            )
+        elif isinstance(self.lens, J.Jlens):
+            self.lens.model = model
+        
+        # Do both Jlens and LogitLens when not testing
+        runs = [True, False] if use_Jlens else [False]
+        for do_activate_Jacobian in runs:
+            result = self.lens.apply_lens(
+                do_activate_Jacobian= do_activate_Jacobian,
+                json_line= json_line,
+                layers_available= layers_available,
+                positions= None,
+                top_k= top_k,
+                MAX_SEQ_LEN= MAX_SEQ_LEN,
+                data_root= data_root
+            )
+            self.lens_cache.put(
+                "jlens" if do_activate_Jacobian else "logit_lens",
+                result,
+            )
+        
+        if save_path is not None:
+            self.lens_cache.save(save_path= save_path, run_name= run_name, top_k= top_k)
+
+    def encode_prompt(self, json_line: str, MAX_LENGTH: int = 300):
+        return self.load_model().encode(text=json_line, max_length=MAX_LENGTH)
+        
+    def run_inference(
+        self,
+        jsonl_line: str,
+        data_root: str,
+        MAX_LENGTH: int = 300,
+    ):
+        """
+        * Returns the last hidden state
+        """
+        model = self.load_model()
+        model.load_data(data_root=data_root)
+        return model.unembed(
+            model.forward(
+                self.encode_prompt(jsonl_line, MAX_LENGTH=MAX_LENGTH)
+            )
+        )
+         
+    def _token_directions(self, token_id: int, layers: list[int]) -> dict[int, torch.Tensor]:
+        """
+        * Unit direction of token_id in the residual space of each layer: d_l = J_l^T u,
+          where u is the token's unembedding row scaled by the final norm weight.
+        * Moving a residual along d_l changes the lens logit of that token.
+        """
+        jacobian_lens = getattr(self.lens, "lens", None)
+        if not isinstance(self.lens, J.Jlens) or jacobian_lens is None:
+            raise RuntimeError("J-vector ablation needs a Jlens. Call fit_Jlens() / load_Jlens() first.")
+        missing = sorted(set(layers) - set(jacobian_lens.source_layers))
+        if missing:
+            raise ValueError(f"layers {missing} are not in the lens source_layers.")
+
+        instance = self.load_model()
+        unembed_row = instance.hf_model.lm_head.weight[token_id].float()
+        unembed_row = unembed_row * instance.text_model.norm.weight.float()
+        directions = {}
+        for layer in layers:
+            jacobian = jacobian_lens.jacobians[layer].to(unembed_row.device, torch.float32)
+            direction = unembed_row @ jacobian
+            directions[layer] = direction / direction.norm().clamp_min(1e-8)
+        return directions
+
+    # TODO: test this!
+    def run_ablation_inference(
+        self,
+        jsonl_line: str,
+        data_root: str,
+        mode: str,
+        layers: list[int],
+        token_pos: list[int],
+        target_token: int | None = None,
+        beta: float | None = None,
+        target_token2: int | None = None,
+        read_positions: list[int] | None = None,
+        MAX_LENGTH: int = 300,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        * Returns (baseline_logits, ablated_logits), each [len(read_positions), vocab] on the CPU.
+        * read_positions defaults to the last position. Python indexing, negatives allowed.
+        * token_pos: positions whose residual is modified, at every layer in layers.
+        * Modes:
+            - "ablation":  set the residual to zero.
+            - "jablation": remove the target_token J-vector component. beta=1 removes it (default), beta=2 reverses it.
+            - "injection": do jablation(beta=1) on target_token, then add the removed magnitude along target_token2.
+        """
+        if mode in ("jablation", "injection") and target_token is None:
+            raise ValueError(f"mode={mode!r} requires target_token.")
+        if mode == "injection" and target_token2 is None:
+            raise ValueError("mode='injection' requires target_token2.")
+
+        directions = directions2 = None
+        if target_token is not None and mode in ("jablation", "injection"):
+            directions = self._token_directions(target_token, layers)
+        if target_token2 is not None and mode == "injection":
+            directions2 = self._token_directions(target_token2, layers)
+
+        spec = Inst.AblationSpec(
+            mode=mode,
+            layers=layers,
+            token_pos=token_pos,
+            directions=directions,
+            beta=1.0 if beta is None else beta,
+            directions2=directions2,
+        )
+
+        instance = self.load_model()
+        instance.load_data(data_root=data_root)
+        input_ids = self.encode_prompt(jsonl_line, MAX_LENGTH=MAX_LENGTH)
+        read = [-1] if read_positions is None else read_positions
+
+        def logits_at(residual: torch.Tensor) -> torch.Tensor:
+            return instance.unembed(residual[0][read]).float().cpu()
+
+        baseline = logits_at(instance.ablation_forward(input_ids))
+        ablated = logits_at(instance.ablation_forward(input_ids, spec))
+        return baseline, ablated
+
+

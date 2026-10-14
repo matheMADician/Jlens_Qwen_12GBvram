@@ -1,14 +1,16 @@
 from jlens.lens import JacobianLens
-from torch import Tensor
 import logging
-from Jlens import lens as l
+from audio_jlens import lens as l
 from model.instance import Instance
 
 class LogitLens(l.Lens):
+    """
+    LogitLens is a specialized lens that applies a JacobianLens to the model's logits.
+    """
     def __init__(self, logger: logging.Logger, model: Instance):
         self.lens = JacobianLens({}, n_prompts= 1, d_model= model.d_model)
         self.model = model
-        
+        self.logger = logger
     def _load_data(self, data_root: str):
         if not data_root:
             raise ValueError("No data root passed to Jlens.")

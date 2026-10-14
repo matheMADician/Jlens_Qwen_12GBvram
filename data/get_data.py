@@ -1,17 +1,46 @@
 """Download and convert a Hugging Face audio dataset for JLens.
 
-Example::
+Arguments:
 
-	python data/get_data.py \
-		--dataset google/fleurs \
-		--config en_us \
-		--split train \
-		--target 50 \
-		--output data/jlens_dataset
+* ``--dataset``: Hugging Face dataset ID (required).
+* ``--config``: Dataset configuration, if required by the dataset.
+* ``--split``: Dataset split to download (default: ``train``).
+* ``--target``: Maximum number of samples to save; omit to process the full split.
+* ``--output``: Output directory for audio and ``prompts.jsonl``.
+* ``--audio-column``: Dataset column containing audio (default: ``audio``).
+* ``--transcription``: Dataset column for the top-level transcript field;
+  auto-detected from transcription-specific column names if omitted.
+* ``--prompt-column``: Dataset column for user instructions; prompt is empty if omitted.
+* ``--min-duration`` / ``--max-duration``: Optional audio-duration filters in seconds.
+* ``--sample-rate``: Output audio sample rate in Hz (default: ``16000``).
+* ``--no-streaming``: Load the complete split instead of streaming it.
+* ``--overwrite``: Replace an existing ``prompts.jsonl`` file.
 
-The generated directory contains ``audio/*.wav`` and ``prompts.jsonl``. The
-paths in ``prompts.jsonl`` are relative to the output directory, which is the
-format expected by ``model/instance.py``.
+The generated directory contains ``audio/*.wav`` and ``prompts.jsonl``. Each
+JSONL record includes a model-agnostic ``messages`` conversation; media paths
+are relative to the output directory.
+
+Example ``prompts.jsonl`` record::
+
+	{
+		"id": "sample-000000",
+		"source_index": 0,
+		"audio_path": "audio/sample-000000.wav",
+		"messages": [
+			{
+				"role": "user",
+				"content": [
+					{"type": "audio", "path": "audio/sample-000000.wav"},
+					{"type": "text", "text": "Dataset-provided instruction"}
+				]
+			}
+		],
+		"transcript": "音訊中的逐字稿"
+	}
+
+Set ``--prompt-column`` to populate the text part of the user message. If it is
+omitted, the text part remains present with an empty string. Transcriptions are
+stored in the top-level ``transcript`` field, not as assistant messages.
 """
 
 from __future__ import annotations
@@ -26,6 +55,7 @@ from typing import Any
 import librosa
 import soundfile as sf
 from datasets import Audio, load_dataset
+from tqdm import tqdm
 
 
 LOGGER = logging.getLogger("get_data")
@@ -42,13 +72,14 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--output", type=Path, default=Path("data/jlens_dataset"))
 	parser.add_argument("--audio-column", default="audio")
 	parser.add_argument(
-		"--text-column",
+		"--transcription",
 		default=None,
-		help="Text/label column; auto-detect when omitted",
+		help="Transcript column; auto-detect when omitted",
 	)
 	parser.add_argument(
-		"--prompt",
-		default="<|audio_bos|><|AUDIO|><|audio_eos|>請寫出這段音訊的逐字稿：",
+		"--prompt-column",
+		default=None,
+		help="Dataset column for user instructions; auto-detect when omitted",
 	)
 	parser.add_argument("--min-duration", type=float, default=0.0)
 	parser.add_argument("--max-duration", type=float, default=float("inf"))
@@ -86,8 +117,7 @@ def save_audio(
 	sf.write(destination, samples, sample_rate)
 	return duration
 
-
-def resolve_text_column(
+def resolve_transcription_column(
 	dataset: Any,
 	requested: str | None,
 	dataset_name: str,
@@ -96,30 +126,63 @@ def resolve_text_column(
 	if requested is not None:
 		if requested not in columns:
 			raise KeyError(
-				f"Text column {requested!r} not found. Available columns: {columns}"
+				f"Transcription column {requested!r} not found. "
+				f"Available columns: {columns}"
 			)
 		return requested
 
 	for candidate in (
 		"transcription",
+		"raw_transcription",
 		"transcript",
-		"text",
-		"sentence",
-		"caption",
-		"category",
-		"label",
 	):
 		if candidate in columns:
-			LOGGER.info("using %r as text column", candidate)
+			LOGGER.info("using %r as transcription column", candidate)
 			return candidate
 
 	LOGGER.warning(
-		"No text or label column found in %s; transcript will be empty. "
+		"No transcription column found in %s; assistant messages will be omitted. "
 		"Available columns: %s",
 		dataset_name,
 		columns,
 	)
 	return None
+
+
+def resolve_prompt_column(
+	dataset: Any,
+	requested: str | None,
+	dataset_name: str,
+) -> str | None:
+	columns = list(dataset.column_names)
+	if requested is None:
+		LOGGER.info(
+			"No prompt column specified for %s; user prompts will be empty.",
+			dataset_name,
+		)
+		return None
+	if requested not in columns:
+		raise KeyError(
+			f"Prompt column {requested!r} not found. Available columns: {columns}"
+		)
+	return requested
+
+
+def build_messages(
+	audio_path: str,
+	instruction: str | None,
+) -> list[dict[str, Any]]:
+	"""Build a model-agnostic conversation using the Hugging Face chat schema."""
+	user_content: list[dict[str, str]] = [
+		{"type": "audio", "path": audio_path},
+		{"type": "text", "text": instruction or ""},
+	]
+	return [
+		{
+			"role": "user",
+			"content": user_content,
+		}
+	]
 
 
 def download_dataset(args: argparse.Namespace) -> int:
@@ -140,10 +203,18 @@ def download_dataset(args: argparse.Namespace) -> int:
 		streaming=not args.no_streaming,
 	)
 	dataset = dataset.cast_column(args.audio_column, Audio(decode=False))
-	text_column = resolve_text_column(dataset, args.text_column, args.dataset)
+	transcription_column = resolve_transcription_column(
+		dataset, args.transcription, args.dataset
+	)
+	prompt_column = resolve_prompt_column(
+		dataset, args.prompt_column, args.dataset
+	)
 
 	records: list[dict[str, Any]] = []
-	for source_index, sample in enumerate(dataset):
+	progress_total = getattr(dataset, "num_rows", None)
+	for source_index, sample in enumerate(
+		tqdm(dataset, total=progress_total, desc="Processing dataset", unit="sample")
+	):
 		if args.target is not None and len(records) >= args.target:
 			break
 
@@ -157,19 +228,31 @@ def download_dataset(args: argparse.Namespace) -> int:
 
 		record_id = f"sample-{len(records):06d}"
 		audio_path = audio_dir / f"{record_id}.wav"
-		duration = save_audio(audio, audio_path, args.sample_rate)
-		text = "" if text_column is None else str(sample[text_column])
-		text = text.replace("\n", " ").strip()
+		save_audio(audio, audio_path, args.sample_rate)
+		raw_text = (
+			None if transcription_column is None else sample[transcription_column]
+		)
+		text = "" if raw_text is None else " ".join(str(raw_text).split())
+		raw_prompt = None if prompt_column is None else sample[prompt_column]
+		prompt = (
+			None if raw_prompt is None else " ".join(str(raw_prompt).split())
+		)
+		if not prompt:
+			prompt = None
+		audio_rel_path = audio_path.relative_to(output_dir).as_posix()
 		records.append(
 			{
 				"id": record_id,
 				"source_index": source_index,
-				"audio_path": audio_path.relative_to(output_dir).as_posix(),
+				"audio_path": audio_rel_path,
+				"messages": build_messages(
+					audio_rel_path,
+					prompt,
+				),
+				# Retain these legacy fields until the model-side loader is migrated.
 				"transcript": text,
-				"prompt": args.prompt,
 			}
 		)
-		LOGGER.info("saved %s/%s (%.2fs)", len(records), args.target or "-", duration)
 
 	with metadata_path.open("w", encoding="utf-8") as metadata_file:
 		for record in records:
@@ -178,11 +261,11 @@ def download_dataset(args: argparse.Namespace) -> int:
 	LOGGER.info("created %s with %d samples", metadata_path, len(records))
 	return len(records)
 
-
 def main() -> None:
 	logging.basicConfig(level=logging.INFO, format="%(levelname)s: %(message)s")
+	for logger_name in ("httpx", "httpcore", "urllib3.connectionpool"):
+		logging.getLogger(logger_name).setLevel(logging.WARNING)
 	download_dataset(parse_args())
-
 
 if __name__ == "__main__":
 	main()

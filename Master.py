@@ -1,11 +1,13 @@
+import os, sys, torch, json, logging
+
 import model.model as M
-from Jlens.Jlens import Jlens
-import parser, os, sys, torch, json, logging
+from audio_jlens.jlens import Jlens
+from json_parser import Parser
+from tools.experiments import Experiments
 
 class Master:
     def __init__(self, run_name: str):
-        self.check_dependencies()
-        self.parser = parser.Parser()
+        Master.check_dependencies()
         self.logger = logging.getLogger()
         self.settings = json.load(open("settings.json", "r", encoding="utf-8"))
         self.model = M.Model(logger= self.logger,
@@ -13,19 +15,26 @@ class Master:
             MODEL_ID= self.settings["model"]["id"])
         self.run_name = run_name
 
+    def _configured_data_root(self) -> str:
+        data_root = self.settings["fitting"].get("root")
+        if not isinstance(data_root, str) or not data_root.strip():
+            raise ValueError("請在 settings.json 設定有效的 fitting.root")
+        return os.path.abspath(os.path.expanduser(data_root))
+
+    # Testing methods
+    # ---------------------------------------------------------------------------------------
     def test_inference(self):
-        data_root = self.settings["data"]["root"]
+        data_root = self._configured_data_root()
         jsonl_path = self.settings["inference"]["jsonl_path"]
         max_length = self.settings["inference"].get("max_length", 300)
 
         if not data_root or not jsonl_path:
             raise ValueError(
-                "請在 settings.json 設定 data.root 與 inference.jsonl_path"
+                "請在 settings.json 設定 fitting.root 與 inference.jsonl_path"
             )
 
-        data_root = os.path.abspath(data_root)
         jsonl_path = os.path.abspath(jsonl_path)
-        lines = self.parser.load_jsonl_lines(jsonl_path)
+        lines = Parser.load_jsonl_lines(jsonl_path)
         if not lines:
             raise ValueError(f"JSONL 沒有可推論的樣本：{jsonl_path}")
 
@@ -55,34 +64,39 @@ class Master:
             raise ValueError("test_training() 需要提供 --run-name")
 
         run_directory = os.path.join(
-            self.settings["checkpoints"]["root"],
+            self.settings["fitting"]["checkpoint_root"],
             self.run_name
         )
         checkpoint_path = os.path.join(run_directory, "fit.pt")
         print(f"Checkpoint path: {checkpoint_path}")
         os.makedirs(run_directory, exist_ok=True)
             
-        self.model.fit_Jlens(
-            jsonl_path= self.settings["data"]["jsonl_path"],
+        self.model.fit_Jlens_batch(
+            jsonl_path= self.settings["fitting"]["jsonl_path"],
+            data_root=self._configured_data_root(),
             checkpoint_save_path= checkpoint_path,
             run_name= self.run_name,
+            dim_batch=self.settings["fitting"].get("dim_batch", 32),
+            MAX_SEQ_LEN=self.settings["fitting"].get("max_seq_len", 300),
+            checkpoint_interval=self.settings["fitting"].get(
+                "checkpoint_interval", 5
+            ),
             mode= None,
             is_test=True,
         )
     
     def test_lens(self):
-        data_root = self.settings["data"]["root"]
-        jsonl_path = self.settings["data"]["jsonl_path"]
+        data_root = self._configured_data_root()
+        jsonl_path = self.settings["fitting"]["jsonl_path"]
         max_length = self.settings["inference"].get("max_length", 300)
         
         if not data_root or not jsonl_path:
             raise ValueError(
-                "請在 settings.json 設定 data.root 與 data.jsonl_path"
+                "請在 settings.json 設定 fitting.root 與 fitting.jsonl_path"
             )
-        
-        data_root = os.path.abspath(data_root)
+
         jsonl_path = os.path.abspath(jsonl_path)
-        lines = self.parser.load_jsonl_lines(jsonl_path)
+        lines = Parser.load_jsonl_lines(jsonl_path)
         if not lines:
             raise ValueError(f"JSONL 沒有可推論的樣本：{jsonl_path}")
         
@@ -100,8 +114,10 @@ class Master:
         )
         
         print(f"Success! Logits: {logits}")
-
-    def calc_JLens(self, mode: str | None = None):
+    
+    # Fitting methods
+    # ---------------------------------------------------------------------------------------
+    def calc_JLens_batch(self, mode: str | None = None):
         """Calls the model's fit_Jlens method to calculate JLens and save it to a checkpoint.
         
         Args:
@@ -112,154 +128,198 @@ class Master:
                 - "S&T2T"
                 - "None" (Will use ordinary fit_jlens() function)
         """
-        checkpoint_root = self.settings["checkpoints"]["root"]
+        checkpoint_root = self.settings["fitting"]["checkpoint_root"]
         checkpoint_name = self.run_name or "default"
         checkpoint_directory = os.path.join(checkpoint_root, checkpoint_name)
         checkpoint_path = os.path.join(checkpoint_directory, "fit.pt")
         os.makedirs(checkpoint_directory, exist_ok=True)
+        
+        # Copy settings.json to the checkpoint directory for reproducibility
+        settings_copy_path = os.path.join(checkpoint_directory, "settings.json")
+        from shutil import copy
+        copy("settings.json", settings_copy_path)
 
-        self.model.fit_Jlens(
-            jsonl_path= self.settings["data"]["jsonl_path"],
+        self.model.fit_Jlens_batch(
+            jsonl_path= self.settings["fitting"]["jsonl_path"],
+            data_root=self._configured_data_root(),
             checkpoint_save_path=checkpoint_path,
             run_name= self.run_name,
+            dim_batch=self.settings["fitting"].get("dim_batch", 32),
+            MAX_SEQ_LEN=self.settings["fitting"].get("max_seq_len", 300),
+            checkpoint_interval=self.settings["fitting"].get(
+                "checkpoint_interval", 5
+            ),
             mode= mode
         )
 
-    def ablation(self):
-        #TODO
-        return
-        jlens_path = self.settings["ablation"]["lens_path"]
-        self.model.load_Jlens(lens_path= jlens_path)
-        
-        selected_layers
-        token_positions
-        heatmap_path
-        
+    def calc_Jlens_experiment(self):
+        """Fit dataset-specific and cumulative-count JLens for an experiment.
 
-    def apply_Jlens(
-        self,
-        lens_path: str
-        ):
-        self.inference_jsonl_path = self.settings["inference"]["jsonl_path"]
-        json_lines = self.parser.load_jsonl_lines(self.inference_jsonl_path)
-        jlens_path = lens_path
-        self.model.load_Jlens(lens_path= jlens_path)
-        task_name = self.run_name or "default"
-        task_output = os.path.join(
-            self.settings["inference"]["output_root"], task_name
+        ``fitting.experiment`` settings:
+          - ``seed``: deterministic shuffle seed (default: 42)
+          - ``mode``: token subset mode, or null for ordinary fitting
+          - ``save_prompt_count``: cumulative successful-sample counts
+          - ``dim_batch``: Jacobian output batch size
+          - ``checkpoint_interval``: fit-state save interval
+        """
+        fitting_settings = self.settings["fitting"]
+        experiment_settings = fitting_settings.get("experiment", {})
+        if not isinstance(experiment_settings, dict):
+            raise ValueError("settings.json 'fitting.experiment' must be an object")
+
+        seed = experiment_settings.get("seed", 42)
+        if not isinstance(seed, int):
+            raise ValueError("settings.json 'fitting.experiment.seed' must be an integer")
+
+        milestone_counts = experiment_settings.get(
+            "save_prompt_count", [1, 2, 5, 10, 20, 50, 100, 200, 500]
         )
-        os.makedirs(task_output, exist_ok=True)
-        for i in range(len(json_lines)):
-            self.model.apply_lens(
-                json_line = json_lines[i],
-                data_root= self.settings["data"]["root"],
-                save_path= task_output,
-                top_k= self.settings["inference"]["top_k"],
-                use_Jlens= True,
-                run_name= task_name,
+        if (
+            not isinstance(milestone_counts, list)
+            or any(not isinstance(count, int) or count <= 0 for count in milestone_counts)
+        ):
+            raise ValueError(
+                "settings.json 'fitting.experiment.save_prompt_count' must be a list "
+                "of positive integers"
             )
+
+        checkpoint_name = self.run_name or "default"
+        experiment_directory = os.path.join(
+            fitting_settings["checkpoint_root"],
+            checkpoint_name,
+            "experiment",
+        )
+        
+        # Ensure the experiment directory exists
+        os.makedirs(experiment_directory, exist_ok=True)
+        checkpoint_path = os.path.join(experiment_directory, "fit.pt")
+        
+        # Copy settings.json to the experiment directory for reproducibility
+        settings_copy_path = os.path.join(experiment_directory, "settings.json")
+        from shutil import copy
+        copy("settings.json", settings_copy_path)
+
+        # Fit
+        self.logger.info(
+            "Starting experiment JLens fit: seed=%d, milestones=%s, output=%s",
+            seed,
+            milestone_counts,
+            experiment_directory,
+        )
+        return self.model.fit_Jlens_for_experiment(
+            jsonl_path=os.path.abspath(fitting_settings["jsonl_path"]),
+            data_root=self._configured_data_root(),
+            seed=seed,
+            dim_batch=fitting_settings.get("dim_batch", 32),
+            MAX_SEQ_LEN=fitting_settings.get("max_seq_len", 300),
+            mode=experiment_settings.get("mode"),
+            save_prompt_count=milestone_counts,
+            checkpoint_save_path=checkpoint_path,
+            run_name=checkpoint_name,
+            is_test=experiment_settings.get("is_test", False),
+            checkpoint_interval=fitting_settings.get("checkpoint_interval", 5),
+        )
+    
+    # Experiment methods
+    # ---------------------------------------------------------------------------------------
+    def ablation(self):
+        Experiments.ablation()
     
     def comp_dataset_choice(self):
-        # TODO do research on the dimensionality of datasets
-        pass
+        Experiments.comp_dataset_choice()
     
     def draw_Jlens_heatmap(
         self,
         lens_path1: str,
         lens_path2: str | None = None,
     ) -> torch.Tensor:
-        """Draw a heatmap using cosine similarity between layers.
-        The returned tensor is indexed as ``[lens1_layer, lens2_layer]``.
-        
-        The y axis represents the first len, while the x axis does for the second.
-
-        Args:
-            heatmap_path: Path where the PNG heatmap will be written.
-            lens_path1 (str): Path to the Jlens checkpoint.
-            lens_path2 (str | None, optional): If not specified, compare lens1 to itself.
-        """
-        heatmap_path = os.path.join(
-            self.settings["inference"]["heatmap_path"],
-            self.run_name or "default",
+        return Experiments.draw_Jlens_cka_heatmap(
+            logger=self.logger,
+            run_name=self.run_name,
+            heatmap_path=os.path.join(
+                self.settings["experiment"]["matrix_analysis"]["output_root"],
+                self.run_name or "default",
+            ),
+            lens_path1=lens_path1,
+            lens_path2=lens_path2,
         )
-        os.makedirs(heatmap_path, exist_ok=True)
-        
-        lens1 = Jlens(self.logger)
-        lens1.load_lens(path=lens_path1)
-        lens2 = lens1 if lens_path2 is None else Jlens(self.logger)
-        if lens_path2 is not None:
-            lens2.load_lens(path=lens_path2)
-
-        assert lens1.lens is not None
-        assert lens2.lens is not None
-        layers1 = lens1.lens.source_layers
-        layers2 = lens2.lens.source_layers
-
-        from tools.math_tools import cos_sim_for_sets, draw_heatmap
-
-        heatmap = cos_sim_for_sets(
-            l1=lens1.lens.jacobians,
-            l2=lens2.lens.jacobians,
-            d1=layers1,
-            d2=layers2,
-        )
-        draw_heatmap(
-            data=heatmap,
-            png_path=os.path.join(heatmap_path, self.run_name or "heatmap"),
-            x_labels=layers2,
-            y_labels=layers1,
-            title="JLens Jacobian cosine similarity",
-        )
-        self.logger.info("Saved JLens heatmap to %s", heatmap_path)
-        return heatmap
 
     def draw_Jlens_svd_heatmaps(
         self,
         lens_path: str,
         top_k: int | None = None,
         device: str = "cpu",
-    ) -> tuple[str, str]:
-        """Save per-layer singular spectra and adjacent-layer subspace heatmaps."""
-        if top_k is None:
-            top_k = int(self.settings["matrix_analysis"]["SVD_top_k"])
-        output_dir = os.path.join(
-            self.settings["inference"]["heatmap_path"],
-            "SVD_analysis",
-            self.run_name or "default",
-        )
-        lens = Jlens(self.logger)
-        lens.load_lens(path=lens_path)
-        assert lens.lens is not None
-
-        from tools.matrix_tools import draw_svd_heatmaps
-
-        paths = draw_svd_heatmaps(
-            jacobians=lens.lens.jacobians,
-            output_dir=output_dir,
-            name=self.run_name or "jlens",
-            top_k=top_k,
+    ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[str]]:
+        return Experiments.draw_Jlens_svd_heatmaps(
+            logger=self.logger,
+            run_name=self.run_name,
+            output_dir=self.settings["experiment"]["matrix_analysis"]["output_root"],
+            lens_path=lens_path,
+            top_k=top_k or int(self.settings["experiment"]["matrix_analysis"]["SVD_top_k"]),
             device=device,
         )
-        self.logger.info("Saved JLens SVD heatmaps to %s", output_dir)
-        return paths
     
     def comp_Jlens(self, lens_path1, lens_path2):
-        # Compares two Jlens
-        Jlens1= Jlens(self.logger)
-        Jlens2= Jlens(self.logger)
+        return Experiments.comp_Jlens(
+            logger=self.logger,
+            lens_path1=lens_path1,
+            lens_path2=lens_path2,
+        )
+    
+    #TODO
+    def eval_Jlens(
+        self,
+        lens_path: str,
+        prompts_path: str,
+    ):
+        """First calls the inference function, calculate the .csv file.
+        Then calls the evaluation function to compute the pass@k AUC.
+
+        Args:
+            lens_path (str): Path to the Jlens file.
+            prompts_path (str): Path to the prompt JSONL file.
+
+        Returns:
+            str: Path to the output directory containing the inference results.
+        """
+    
+    # Inference methods
+    # ---------------------------------------------------------------------------------------
+    def apply_Jlens(
+        self,
+        lens_path: str,
+        prompts_path: str,
+        top_k: int | None = None,
+        ) -> str:
+        """Inference the Jlens on the given prompt set.
+
+        Args:
+            lens_path (str): Path to the Jlens file.
+            prompts_path (str): Path to the prompt JSONL file.
+            top_k (int | None, optional): Number of top predictions to consider. 
+                The Default is at settings["inference"]["top_k"].
+        """
+        json_lines = Parser.load_jsonl_lines(prompts_path)
+        self.model.load_Jlens(lens_path= lens_path)
         
-        Jlens1.load_lens(lens_path1)
-        Jlens2.load_lens(lens_path2)
-        
-        # Phase 1
-        # Draw a heatmap between layers using two similarity functions
-            # 1. cosine similarity
-            # 2. CKA similarity
-        
-        # Phase 2
-        # Calculate the overall 
-            
-    def check_dependencies(self):
+        output_root = os.path.join(
+            self.settings["inference"]["output_root"], self.run_name
+        )
+        os.makedirs(output_root, exist_ok=True)
+        for i in range(len(json_lines)):
+            self.model.apply_lens(
+                json_line = json_lines[i],
+                data_root=self._configured_data_root(),
+                save_path= output_root,
+                top_k= top_k or self.settings["inference"]["top_k"],
+                use_Jlens= True,
+                run_name= self.run_name,
+            )
+        return output_root
+
+    
+    @staticmethod
+    def check_dependencies():
         print("=" * 70)
         print("[Step 0] 依賴檢查")
         print("=" * 70)

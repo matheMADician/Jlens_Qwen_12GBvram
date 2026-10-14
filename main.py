@@ -11,6 +11,7 @@ parser.add_argument(
 if __name__ == "__main__":
     args = parser.parse_args()
     master = Master(run_name=args.run_name)
+    master.calc_Jlens_experiment()
     #master.test_inference()
     #master.apply_Jlens(lens_path= "/home/c8763c8763/Jlens/Jlens/output/checkpoints/esc50-50_+_libri-50_S&T2T/lens.pt")
     """
@@ -28,9 +29,11 @@ if __name__ == "__main__":
         lens_path2= "output/checkpoints/esc50-50_+_libri-50_T2T/lens.pt"
     )
     """
+    """
     master.draw_Jlens_svd_heatmaps(
         lens_path= "output/checkpoints/esc50-50_+_libri-50_T2T/lens.pt",
     )
+    """
     
     
     

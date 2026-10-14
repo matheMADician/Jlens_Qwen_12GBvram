@@ -8,6 +8,10 @@ __pycache__/
 .ipynb_checkpoints/
 
 # Local datasets and downloaded audio
+/data/assembled/
+/data/llama/
+/data/old_data/
+/data/TODO.md
 /data/**/*.wav
 /data/**/*.mp3
 /data/**/*.flac
@@ -21,7 +25,14 @@ outputs.txt
 
 # Local debug/config files
 .vscode/
+How_to_Run.txt
 How_to_Run_debug.txt
+log.txt
+start_debug.sh
+test_gpu.sh
 
 # Separate project and local analysis artifacts
 /Other_stuff/
+
+# Copilot files
+/.github/copilot-instructions.md
