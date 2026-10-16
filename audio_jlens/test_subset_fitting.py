@@ -1,5 +1,6 @@
 import json, os, tempfile
 from collections.abc import Sequence
+import random
 
 import torch
 from torch import nn
@@ -179,3 +180,74 @@ def test_subset_fit_experiment():
         merged = JacobianLens.merge([dataset_lenses["esc50"], dataset_lenses["animalqa"]])
         assert torch.allclose(merged.jacobians[0], combined_lens.jacobians[0], atol=1e-6)
 
+
+def test_subset_fit_experiment_caps_shuffled_prompts_and_validates_resume():
+    model = _Model()
+    prompts = [
+        _sample_prompt(str(sample_id), "ESC50" if sample_id % 2 else "Clotho")
+        for sample_id in range(1, 7)
+    ]
+    seed = 42
+    cap = 3
+    expected_prompts = prompts.copy()
+    random.Random(seed).shuffle(expected_prompts)
+    expected_dataset_counts = {}
+    for prompt in expected_prompts[:cap]:
+        sample = json.loads(prompt)
+        dataset = sample["dataset_name"].lower()
+        expected_dataset_counts[dataset] = expected_dataset_counts.get(dataset, 0) + 1
+
+    with tempfile.TemporaryDirectory() as tmp_dir:
+        checkpoint_path = os.path.join(tmp_dir, "ckpt.pt")
+        combined_lens, dataset_lenses, _ = subset_fit_experiment(
+            model=model,
+            prompts=prompts,
+            seed=seed,
+            mode=None,
+            save_prompt_counts=[1, cap],
+            source_layers=[0],
+            target_layer=1,
+            dim_batch=2,
+            max_seq_len=24,
+            skip_first=16,
+            output_dir=tmp_dir,
+            checkpoint_path=checkpoint_path,
+            checkpoint_every=1,
+            resume=False,
+            max_prompts=cap,
+        )
+
+        assert combined_lens.n_prompts == cap
+        assert {
+            dataset: lens.n_prompts for dataset, lens in dataset_lenses.items()
+        } == expected_dataset_counts
+
+        with open(os.path.join(tmp_dir, "metadata.json"), encoding="utf-8") as f:
+            metadata = json.load(f)
+        assert metadata["total_prompts_input"] == len(prompts)
+        assert metadata["total_prompts_selected"] == cap
+        assert metadata["max_prompts"] == cap
+        assert sum(metadata["dataset_counts"].values()) == cap
+
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        assert state["max_prompts"] == cap
+
+        try:
+            subset_fit_experiment(
+                model=model,
+                prompts=prompts,
+                seed=seed,
+                mode=None,
+                source_layers=[0],
+                target_layer=1,
+                dim_batch=2,
+                max_seq_len=24,
+                skip_first=16,
+                checkpoint_path=checkpoint_path,
+                resume=True,
+                max_prompts=cap - 1,
+            )
+        except ValueError as exc:
+            assert "max_prompts" in str(exc)
+        else:
+            raise AssertionError("resuming with a different cap should fail")

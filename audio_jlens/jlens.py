@@ -2,7 +2,7 @@ from jlens.lens import JacobianLens
 import os, logging
 from audio_jlens import lens as l
 from audio_jlens.subset_fitting import subset_fit
-from model.instance import Instance
+from model.adapters.Instance import Instance
 from json_parser import Parser
 
 class Jlens(l.Lens):

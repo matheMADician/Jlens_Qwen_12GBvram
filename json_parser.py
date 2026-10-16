@@ -125,6 +125,7 @@ class Parser:
     def load_audio(sample_id: int, audio_path: str, sampling_rate: int):
         """
         * Accepts the absolute path to the audio.
+        * Returns the loaded audio as a numpy array.
         """
         audio_path = str(Path(audio_path).resolve())
         if not os.path.isfile(audio_path):

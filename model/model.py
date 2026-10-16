@@ -4,8 +4,17 @@ import torch
 from torch import Tensor
 
 from audio_jlens import jlens as J, lens, logitLens as L
-from model import instance as Inst
+from model.adapters.Instance import AblationSpec, Instance
+from model.adapters.qwen25_omni import Instance as Qwen25OmniInstance
+from model.adapters.qwen2_audio import Instance as Qwen2AudioInstance
 from jacobian_lens.jlens.lens import JacobianLens
+
+
+MODEL_ADAPTERS: dict[str, type[Instance]] = {
+    "Qwen/Qwen2.5-Omni-7B": Qwen25OmniInstance,
+    "Qwen/Qwen2-Audio-7B": Qwen2AudioInstance,
+}
+
 
 class LensOutputCache:
     """
@@ -247,23 +256,32 @@ class Model:
     """
     def __init__(self,
         logger: logging.Logger,
+        MODEL_ID: str,
+        adapter: str,
         do_4bit: bool = False,
-        MODEL_ID="Qwen/Qwen2.5-Omni-7B"
-        ):
+    ):
         
         self.logger = logger
         self.model_id = MODEL_ID
         self.do_4bit = do_4bit
+        self.adapter_name = adapter
+        try:
+            self.adapter_class: type[Instance] = MODEL_ADAPTERS[adapter]
+        except KeyError as exc:
+            raise ValueError(
+                f"Unknown model adapter {adapter!r}; "
+                f"available adapters: {sorted(MODEL_ADAPTERS)}"
+            ) from exc
         # A model is fixed to a single Jlens. fit_Jlens_for_experiment
         #   will create multiple sub-lens, but only the combined one is binded.
         self.lens: lens.Lens | None = None
-        self._model: Inst.Instance | None = None
+        self._model: Instance | None = None
         self.lens_cache = LensOutputCache()
 
-    def load_model(self) -> Inst.Instance:
+    def load_model(self) -> Instance:
         """Load the model once, reusing it on subsequent calls."""
         if self._model is None:
-            model = Inst.Instance(
+            model = self.adapter_class(
                 MODEL_ID=self.model_id,
                 do_4bit=self.do_4bit,
             )
@@ -271,8 +289,21 @@ class Model:
             self.lens_cache.tokenizer = model.tokenizer
         return self._model
 
+    def scoped_output_root(self, output_root: str) -> str:
+        """Append the model ID's final path component to an output root."""
+        if not output_root:
+            raise ValueError("output_root must not be empty")
+        model_name = self.model_id.rstrip("/\\").replace("\\", "/").rsplit("/", 1)[-1]
+        if not model_name or model_name in {".", ".."}:
+            raise ValueError(f"Cannot derive a model name from {self.model_id!r}")
+
+        root = Path(os.path.expanduser(output_root))
+        if root.name == model_name:
+            return str(root)
+        return str(root / model_name)
+
     @property
-    def model(self) -> Inst.Instance:
+    def model(self) -> Instance:
         return self.load_model()
 
     @property
@@ -354,8 +385,12 @@ class Model:
         is_test: bool = False,
         data_root: str | None = None,
         checkpoint_interval: int = 5,
+        max_prompts: int | None = None,
     ) -> tuple[JacobianLens, dict[str, JacobianLens], dict[int, JacobianLens]]:
         """Fit and save Jacobian lenses for data-size and per-dataset experiments.
+
+        `max_prompts`, when set, caps the deterministically shuffled input
+        records before fitting.
 
         Saves:
           1. One JacobianLens for each dataset.
@@ -393,10 +428,16 @@ class Model:
             output_dir = os.path.dirname(checkpoint_save_path)
             ckpt_file = checkpoint_save_path
         elif run_name is not None:
-            output_dir = os.path.join(os.getcwd(), "output", "checkpoints", run_name)
+            output_dir = os.path.join(
+                self.scoped_output_root(os.path.join(os.getcwd(), "output", "checkpoints")),
+                run_name,
+            )
             ckpt_file = os.path.join(output_dir, "fit_checkpoint.pt")
         else:
-            output_dir = os.path.join(os.getcwd(), "output", "checkpoints", f"experiment_seed_{seed}")
+            output_dir = os.path.join(
+                self.scoped_output_root(os.path.join(os.getcwd(), "output", "checkpoints")),
+                f"experiment_seed_{seed}",
+            )
             ckpt_file = os.path.join(output_dir, "fit_checkpoint.pt")
 
         os.makedirs(output_dir, exist_ok=True)
@@ -415,6 +456,7 @@ class Model:
             checkpoint_path=ckpt_file,
             checkpoint_every=checkpoint_interval,
             resume=os.path.exists(ckpt_file),
+            max_prompts=max_prompts,
             processor=model.processor,
             data_root=audio_root,
         )
@@ -507,8 +549,7 @@ class Model:
             raise ValueError(f"layers {missing} are not in the lens source_layers.")
 
         instance = self.load_model()
-        unembed_row = instance.hf_model.lm_head.weight[token_id].float()
-        unembed_row = unembed_row * instance.text_model.norm.weight.float()
+        unembed_row = instance.get_unembedding_direction(token_id)
         directions = {}
         for layer in layers:
             jacobian = jacobian_lens.jacobians[layer].to(unembed_row.device, torch.float32)
@@ -550,7 +591,7 @@ class Model:
         if target_token2 is not None and mode == "injection":
             directions2 = self._token_directions(target_token2, layers)
 
-        spec = Inst.AblationSpec(
+        spec = AblationSpec(
             mode=mode,
             layers=layers,
             token_pos=token_pos,
@@ -570,5 +611,3 @@ class Model:
         baseline = logits_at(instance.ablation_forward(input_ids))
         ablated = logits_at(instance.ablation_forward(input_ids, spec))
         return baseline, ablated
-
-

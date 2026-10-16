@@ -167,6 +167,7 @@ instance.load_data("dataset")
 {
   "model": {
     "id": "Qwen/Qwen2-Audio-7B-Instruct",
+    "adapter": "qwen2_audio",
     "load_in_4bit": false
   },
   "data": {
@@ -192,6 +193,9 @@ instance.load_data("dataset")
 
 執行前請確認 `data.root`、`data.jsonl_path` 和
 `checkpoints.load_path` 指向目前要使用的資料與 checkpoint。
+程式會在 `fitting.checkpoint_root`、`inference.output_root` 及實驗輸出根目錄下
+自動加入模型 ID 最後一段作為子目錄，例如 `Qwen/Qwen2-Audio-7B` 會使用
+`<output_root>/Qwen2-Audio-7B`。
 
 ### 建立模型
 
@@ -200,6 +204,7 @@ from model.model import Model
 
 model = Model(
     MODEL_ID="Qwen/Qwen2-Audio-7B-Instruct",
+    adapter="qwen2_audio",
     do_4bit=False,
 )
 ```
@@ -259,8 +264,10 @@ cat slurm-<JOBID>.out
 ### 繪製 JLens heatmap
 
 `Master.draw_Jlens_heatmap()` 會比較 Jacobian matrices 本身，不是 activation
-CKA。單一 JLens 會產生 layer × layer 的 cosine similarity；指定第二個
-checkpoint 時，會產生 `lens1 layer × lens2 layer` 的比較圖。
+CKA。預設使用 linear CKA，也可以指定 `mode="cos"` 使用 Jacobian matrices
+的 cosine similarity。單一 JLens 會產生 layer × layer 比較；指定第二個
+checkpoint 時，會產生 `lens1 layer × lens2 layer` 比較圖。計算會在 CUDA
+可用時自動使用 GPU，否則使用 CPU；也可以透過 `device` 參數指定裝置。
 
 ```python
 from Master import Master
@@ -270,6 +277,16 @@ heatmap = master.draw_Jlens_heatmap(
   heatmap_path="output/heatmaps/jlens_comparison.png",
   lens_path1="output/checkpoints/esc50-50_fleurs_en_us-50/lens.pt",
   lens_path2="output/checkpoints/esc50-50_libri-50/lens.pt",
+)
+```
+
+使用 cosine similarity：
+
+```python
+heatmap = master.draw_Jlens_heatmap(
+  lens_path1="output/checkpoints/first/lens.pt",
+  lens_path2="output/checkpoints/second/lens.pt",
+  mode="cos",
 )
 ```
 

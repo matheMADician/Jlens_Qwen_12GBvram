@@ -18,11 +18,45 @@
 
 
 python data/get_data.py \
-	--dataset google/fleurs \
-	--config cmn_hans_cn \
-	--split train \
-	--target 1000 \
-	--output data/datasets/fleurs_cmn_hans_cn \
+	--dataset SLLM-multi-hop/AnimalQA \
+	--config default \
+	--split test \
+	--target 500 \
+	--output data/datasets/SAKURA/AnimalQA \
 	--audio-column audio \
-	--transcription raw_transcription \
+	--transcription single_answer \
+	--prompt-column multi_instruction \
+	--overwrite
+
+python data/get_data.py \
+	--dataset SLLM-multi-hop/GenderQA \
+	--config default \
+	--split test \
+	--target 500 \
+	--output data/datasets/SAKURA/GenderQA \
+	--audio-column audio \
+	--transcription single_answer \
+	--prompt-column multi_instruction \
+	--overwrite
+
+python data/get_data.py \
+	--dataset SLLM-multi-hop/EmotionQA \
+	--config default \
+	--split test \
+	--target 500 \
+	--output data/datasets/SAKURA/EmotionQA \
+	--audio-column audio \
+	--transcription single_answer \
+	--prompt-column multi_instruction \
+	--overwrite
+
+python data/get_data.py \
+	--dataset SLLM-multi-hop/LanguageQA \
+	--config default \
+	--split test \
+	--target 500 \
+	--output data/datasets/SAKURA/LanguageQA \
+	--audio-column audio \
+	--transcription single_answer \
+	--prompt-column multi_instruction \
 	--overwrite

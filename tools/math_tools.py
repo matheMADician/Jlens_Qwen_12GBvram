@@ -1,6 +1,7 @@
 from collections.abc import Sequence, Callable
 import os
 
+import torch
 from torch import Tensor, empty, stack
 
 class MathTools:
@@ -32,6 +33,7 @@ class MathTools:
         l2: dict[int, Tensor],
         d1: Sequence[int],
         d2: Sequence[int],
+        device: str | torch.device | None = None,
     ) -> Tensor:
         """
         Compute pairwise linear CKA between two sets of representations.
@@ -39,39 +41,68 @@ class MathTools:
         The first dimension of every representation must index the same examples.
         Remaining dimensions are treated as features, so both vectors and matrices
         are accepted. The returned tensor is indexed as ``[d1_layer, d2_layer]``.
+        Computation defaults to CUDA when available, otherwise CPU; the returned
+        heatmap is on CPU.
 
         Args:
             l1, l2: Layer-to-representation mappings.
             d1, d2: Layer indices to compare from ``l1`` and ``l2``.
+            device: Device for the CKA calculation. Defaults to CUDA when
+                available, otherwise CPU.
         """
-        def linear_cka(x: Tensor, y: Tensor) -> Tensor:
-            if x.ndim == 0 or y.ndim == 0:
-                raise ValueError("CKA representations must have a sample dimension")
+        compute_device = torch.device(
+            device
+            if device is not None
+            else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+
+        def prepare(representations: dict[int, Tensor], layers: Sequence[int]):
+            prepared = {}
+            covariance_norms = {}
+            for layer in layers:
+                values = representations[layer]
+                if values.ndim == 0:
+                    raise ValueError(
+                        "CKA representations must have a sample dimension"
+                    )
+                values = values.reshape(values.shape[0], -1).to(
+                    device=compute_device, dtype=torch.float32
+                )
+                values = values - values.mean(dim=0, keepdim=True)
+                prepared[layer] = values
+                covariance_norm = torch.linalg.matrix_norm(values.T @ values)
+                if covariance_norm == 0:
+                    raise ValueError(
+                        "CKA is undefined for a constant representation"
+                    )
+                covariance_norms[layer] = covariance_norm
+            return prepared, covariance_norms
+
+        if not d1 or not d2:
+            return torch.empty((len(d1), len(d2)))
+
+        prepared1, norms1 = prepare(l1, d1)
+        if l1 is l2 and d1 == d2:
+            prepared2, norms2 = prepared1, norms1
+        else:
+            prepared2, norms2 = prepare(l2, d2)
+
+        def linear_cka(layer_1: int, layer_2: int) -> Tensor:
+            x = prepared1[layer_1]
+            y = prepared2[layer_2]
             if x.shape[0] != y.shape[0]:
                 raise ValueError(
                     "CKA representations must contain the same number of samples"
                 )
 
-            x = x.reshape(x.shape[0], -1).float()
-            y = y.reshape(y.shape[0], -1).float()
-            x = x - x.mean(dim=0, keepdim=True)
-            y = y - y.mean(dim=0, keepdim=True)
-
-            xy = x.T @ y
-            xx = x.T @ x
-            yy = y.T @ y
-            denominator = xx.norm() * yy.norm()
-            if denominator == 0:
-                raise ValueError("CKA is undefined for a constant representation")
-            return (xy.norm().square() / denominator)
+            denominator = norms1[layer_1] * norms2[layer_2]
+            return torch.linalg.matrix_norm(x.T @ y).square() / denominator
 
         values = [
-            [linear_cka(l1[layer_1], l2[layer_2]) for layer_2 in d2]
+            [linear_cka(layer_1, layer_2) for layer_2 in d2]
             for layer_1 in d1
         ]
-        if not values:
-            return Tensor([])
-        return stack([stack(row) for row in values])
+        return torch.stack([torch.stack(row) for row in values]).detach().cpu()
     
     @staticmethod
     def sim_for_sets(

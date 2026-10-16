@@ -273,6 +273,7 @@ def _compute_single_prompt_jacobian(
             source_layers=source_layers,
             target_layer=target_layer,
             dim_batch=dim_batch,
+            max_seq_len=effective_max_seq_len,
             skip_first=skip_first,
         )
 
@@ -323,6 +324,7 @@ def subset_fit_experiment(
     checkpoint_path: str | None = None,
     checkpoint_every: int | None = 1,
     resume: bool = True,
+    max_prompts: int | None = None,
     *,
     processor: Any | None = None,
     data_root: str | None = None,
@@ -341,6 +343,9 @@ def subset_fit_experiment(
         mode: Token subset mode ("S2T", "S2S", "T2T", "S&T2T", or None).
         save_prompt_counts: List of prompt counts (e.g. [1, 2, 5, 10, ...]) at which
             to save cumulative lenses.
+        max_prompts: Optional cap on the number of prompts fitted. The cap is
+            applied after deterministic shuffling so it does not select only
+            the beginning of the input file.
         source_layers: Layer indices to compute J_l at.
         target_layer: Target layer for gradients.
         dim_batch: Batch size for Jacobian output dimensions.
@@ -358,6 +363,13 @@ def subset_fit_experiment(
     """
     import random
 
+    if max_prompts is not None and (
+        not isinstance(max_prompts, int)
+        or isinstance(max_prompts, bool)
+        or max_prompts <= 0
+    ):
+        raise ValueError("max_prompts must be a positive integer or None")
+
     effective_max_seq_len = max_seq_len if max_seq_len is not None else 3000
 
     n_layers, d_model = model.n_layers, model.d_model
@@ -366,9 +378,19 @@ def subset_fit_experiment(
     )
 
     # Deterministically shuffle prompts using a dedicated Random instance
+    total_prompts_input = len(prompts)
     shuffled_prompts = list(prompts)
     rng = random.Random(seed)
     rng.shuffle(shuffled_prompts)
+    if max_prompts is not None:
+        shuffled_prompts = shuffled_prompts[:max_prompts]
+
+    logger.info(
+        "Fitting %d/%d prompts after deterministic shuffle (max_prompts=%s)",
+        len(shuffled_prompts),
+        total_prompts_input,
+        max_prompts,
+    )
 
     sorted_milestones = sorted(set(save_prompt_counts)) if save_prompt_counts else []
 
@@ -405,8 +427,14 @@ def subset_fit_experiment(
                 if key in state and state[key] != expected:
                     raise ValueError(
                         f"checkpoint at {checkpoint_path} was fitted with {key}="
-                        f"{state[key]!r}, not {expected!r}; pass resume=False to discard it"
+                        f"{state.get(key)!r}, not {expected!r}; pass resume=False to discard it"
                     )
+            if state.get("max_prompts") != max_prompts:
+                raise ValueError(
+                    f"checkpoint at {checkpoint_path} was fitted with max_prompts="
+                    f"{state.get('max_prompts')!r}, not {max_prompts!r}; "
+                    "pass resume=False to discard it"
+                )
             total_jacobian_sum = state["total_jacobian_sum"]
             dataset_jacobian_sums = state["dataset_jacobian_sums"]
             dataset_counts = state["dataset_counts"]
@@ -434,6 +462,7 @@ def subset_fit_experiment(
                     "target_layer": target_layer,
                     "skip_first": skip_first,
                     "seed": seed,
+                    "max_prompts": max_prompts,
                 },
                 checkpoint_path,
             )
@@ -542,7 +571,9 @@ def subset_fit_experiment(
         import json
         meta = {
             "seed": seed,
-            "total_prompts_input": len(shuffled_prompts),
+            "total_prompts_input": total_prompts_input,
+            "total_prompts_selected": len(shuffled_prompts),
+            "max_prompts": max_prompts,
             "total_done": total_done,
             "dataset_counts": dataset_counts,
             "saved_milestones": sorted(saved_milestones),

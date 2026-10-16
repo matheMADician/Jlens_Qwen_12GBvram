@@ -13,4 +13,4 @@
 export HF_HOME="/work/c8763c8763/huggingface-cache"
 mkdir -p "$HF_HOME"
 
-/home/c8763c8763/.conda/envs/jlens/bin/python /home/c8763c8763/Jlens/Jlens/main.py --run-name train_1_no_SAKURA
+/home/c8763c8763/.conda/envs/jlens/bin/python /home/c8763c8763/Jlens/Jlens/main.py --run-name train_1_no_SAKURA_On_Animal

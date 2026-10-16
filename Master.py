@@ -2,7 +2,7 @@ import os, sys, torch, json, logging
 
 import model.model as M
 from audio_jlens.jlens import Jlens
-from json_parser import Parser
+from json_parser import ParsedSample, Parser
 from tools.experiments import Experiments
 
 class Master:
@@ -12,7 +12,8 @@ class Master:
         self.settings = json.load(open("settings.json", "r", encoding="utf-8"))
         self.model = M.Model(logger= self.logger,
             do_4bit= self.settings["model"]["load_in_4bit"],
-            MODEL_ID= self.settings["model"]["id"])
+            MODEL_ID= self.settings["model"]["id"],
+            adapter=self.settings["model"]["adapter"])
         self.run_name = run_name
 
     def _configured_data_root(self) -> str:
@@ -20,6 +21,11 @@ class Master:
         if not isinstance(data_root, str) or not data_root.strip():
             raise ValueError("請在 settings.json 設定有效的 fitting.root")
         return os.path.abspath(os.path.expanduser(data_root))
+
+    def _model_output_root(self, output_root: str) -> str:
+        if not isinstance(output_root, str) or not output_root.strip():
+            raise ValueError("Output root must be a non-empty string.")
+        return self.model.scoped_output_root(output_root)
 
     # Testing methods
     # ---------------------------------------------------------------------------------------
@@ -50,7 +56,10 @@ class Master:
 
         next_token_logits = logits[0, -1]
         top_ids = torch.topk(next_token_logits, k=5).indices.tolist()
-        top_tokens = self.model.model.tokenizer.decode(
+        tokenizer = self.model.model.tokenizer
+        if tokenizer is None:
+            raise RuntimeError("The configured model adapter has no tokenizer.")
+        top_tokens = tokenizer.decode(
             top_ids,
             skip_special_tokens=False,
             clean_up_tokenization_spaces=False,
@@ -60,11 +69,8 @@ class Master:
         return logits
 
     def test_training(self):
-        if not self.run_name:
-            raise ValueError("test_training() 需要提供 --run-name")
-
         run_directory = os.path.join(
-            self.settings["fitting"]["checkpoint_root"],
+            self._model_output_root(self.settings["fitting"]["checkpoint_root"]),
             self.run_name
         )
         checkpoint_path = os.path.join(run_directory, "fit.pt")
@@ -128,7 +134,9 @@ class Master:
                 - "S&T2T"
                 - "None" (Will use ordinary fit_jlens() function)
         """
-        checkpoint_root = self.settings["fitting"]["checkpoint_root"]
+        checkpoint_root = self._model_output_root(
+            self.settings["fitting"]["checkpoint_root"]
+        )
         checkpoint_name = self.run_name or "default"
         checkpoint_directory = os.path.join(checkpoint_root, checkpoint_name)
         checkpoint_path = os.path.join(checkpoint_directory, "fit.pt")
@@ -159,6 +167,7 @@ class Master:
           - ``seed``: deterministic shuffle seed (default: 42)
           - ``mode``: token subset mode, or null for ordinary fitting
           - ``save_prompt_count``: cumulative successful-sample counts
+          - ``max_prompts``: optional cap applied after deterministic shuffling
           - ``dim_batch``: Jacobian output batch size
           - ``checkpoint_interval``: fit-state save interval
         """
@@ -167,7 +176,7 @@ class Master:
         if not isinstance(experiment_settings, dict):
             raise ValueError("settings.json 'fitting.experiment' must be an object")
 
-        seed = experiment_settings.get("seed", 42)
+        seed = experiment_settings["seed"]
         if not isinstance(seed, int):
             raise ValueError("settings.json 'fitting.experiment.seed' must be an integer")
 
@@ -183,9 +192,20 @@ class Master:
                 "of positive integers"
             )
 
+        max_prompts = experiment_settings.get("max_prompts")
+        if max_prompts is not None and (
+            not isinstance(max_prompts, int)
+            or isinstance(max_prompts, bool)
+            or max_prompts <= 0
+        ):
+            raise ValueError(
+                "settings.json 'fitting.experiment.max_prompts' must be "
+                "a positive integer or null"
+            )
+
         checkpoint_name = self.run_name or "default"
         experiment_directory = os.path.join(
-            fitting_settings["checkpoint_root"],
+            self._model_output_root(fitting_settings["checkpoint_root"]),
             checkpoint_name,
             "experiment",
         )
@@ -201,8 +221,10 @@ class Master:
 
         # Fit
         self.logger.info(
-            "Starting experiment JLens fit: seed=%d, milestones=%s, output=%s",
+            "Starting experiment JLens fit: seed=%d, max_prompts=%s, "
+            "milestones=%s, output=%s",
             seed,
+            max_prompts,
             milestone_counts,
             experiment_directory,
         )
@@ -218,6 +240,7 @@ class Master:
             run_name=checkpoint_name,
             is_test=experiment_settings.get("is_test", False),
             checkpoint_interval=fitting_settings.get("checkpoint_interval", 5),
+            max_prompts=max_prompts,
         )
     
     # Experiment methods
@@ -232,17 +255,38 @@ class Master:
         self,
         lens_path1: str,
         lens_path2: str | None = None,
+        device: str | torch.device | None = None,
+        mode: str | None = None,
     ) -> torch.Tensor:
-        return Experiments.draw_Jlens_cka_heatmap(
-            logger=self.logger,
-            run_name=self.run_name,
-            heatmap_path=os.path.join(
-                self.settings["experiment"]["matrix_analysis"]["output_root"],
-                self.run_name or "default",
-            ),
-            lens_path1=lens_path1,
-            lens_path2=lens_path2,
-        )
+        if mode is None or mode == "cka":
+            return Experiments.draw_Jlens_cka_heatmap(
+                logger=self.logger,
+                run_name=self.run_name,
+                heatmap_path=os.path.join(
+                    self._model_output_root(
+                        self.settings["experiment"]["matrix_analysis"]["output_root"]
+                    ),
+                    self.run_name or "default",
+                ),
+                lens_path1=lens_path1,
+                lens_path2=lens_path2,
+                device=device,
+            )
+        elif mode == "cos":
+            return Experiments.draw_Jlens_cosine_heatmap(
+                logger=self.logger,
+                run_name=self.run_name,
+                heatmap_path=os.path.join(
+                    self._model_output_root(
+                        self.settings["experiment"]["matrix_analysis"]["output_root"]
+                    ),
+                    self.run_name or "default",
+                ),
+                lens_path1=lens_path1,
+                lens_path2=lens_path2,
+                device=device,
+            )
+        raise ValueError(f"Unknown JLens heatmap mode: {mode!r}; expected 'cka' or 'cos'.")
 
     def draw_Jlens_svd_heatmaps(
         self,
@@ -253,7 +297,9 @@ class Master:
         return Experiments.draw_Jlens_svd_heatmaps(
             logger=self.logger,
             run_name=self.run_name,
-            output_dir=self.settings["experiment"]["matrix_analysis"]["output_root"],
+            output_dir=self._model_output_root(
+                self.settings["experiment"]["matrix_analysis"]["output_root"]
+            ),
             lens_path=lens_path,
             top_k=top_k or int(self.settings["experiment"]["matrix_analysis"]["SVD_top_k"]),
             device=device,
@@ -266,22 +312,130 @@ class Master:
             lens_path2=lens_path2,
         )
     
-    #TODO
     def eval_Jlens(
         self,
         lens_path: str,
         prompts_path: str,
+        top_k: int | None = None,
+        layer: int | None = None,
     ):
-        """First calls the inference function, calculate the .csv file.
-        Then calls the evaluation function to compute the pass@k AUC.
+        """Evaluate target-token pass@k and normalized AUC for a JLens.
+
+        The target token is scored at the final prompt position. If ``layer``
+        is omitted, each prompt uses the best answer-token rank across all
+        available JLens layers. If supplied, only that layer is evaluated.
+        When a transcript tokenizes into multiple tokens, only its first token
+        is scored.
 
         Args:
-            lens_path (str): Path to the Jlens file.
+            lens_path (str): Path to the JLens file.
             prompts_path (str): Path to the prompt JSONL file.
+            top_k: Number of predictions to include in the inference CSV.
+            layer: Optional JLens layer index to evaluate.
 
         Returns:
-            str: Path to the output directory containing the inference results.
+            str: Path to the output directory containing predictions and metrics.
         """
+        from tools.experiments import passk_cache as PassKCache
+
+        evaluation_settings = self.settings["experiment"]["pass_k_AUC"]
+        k_values = evaluation_settings.get("k_values")
+        if (
+            not isinstance(k_values, list)
+            or not k_values
+            or any(not isinstance(k, int) or k <= 0 for k in k_values)
+        ):
+            raise ValueError(
+                "experiment.pass_k_AUC.k_values must be a non-empty list "
+                "of positive integers"
+            )
+        k_values = sorted(set(k_values))
+        csv_top_k = top_k or self.settings["inference"]["top_k"]
+
+        passk_results = PassKCache(
+            prompt_cnt=0,
+            best_token_pos=[],
+            best_k_values=[],
+            best_probability=[],
+        )
+
+        json_lines = Parser.load_jsonl_lines(prompts_path)
+        if not json_lines:
+            raise ValueError(f"Prompt JSONL contains no samples: {prompts_path}")
+
+        task_name = self.run_name or "default"
+        self.model.load_Jlens(lens_path= lens_path)
+        output_root = os.path.join(
+            self._model_output_root(self.settings["inference"]["output_root"]),
+            task_name,
+        )
+        os.makedirs(output_root, exist_ok=True)
+
+        passk_summary: (
+            dict[str, float | int | dict[int, float] | list[float]] | None
+        ) = None
+        for i in range(len(json_lines)):
+            self.model.apply_lens(
+                json_line=json_lines[i],
+                data_root=self._configured_data_root(),
+                save_path=output_root,
+                top_k=csv_top_k,
+                use_Jlens=True,
+                run_name=task_name,
+                layers_available=[layer] if layer is not None else None,
+            )
+
+            line_parsed: ParsedSample = Parser.parse_json_line(json_lines[i])
+            transcript = line_parsed.transcript
+            if transcript is None or not transcript.strip():
+                raise ValueError(
+                    f"Sample {line_parsed.sample_id} has no transcript to evaluate"
+                )
+
+            transcript = transcript.strip()
+            if transcript.startswith("(") and ")" in transcript:
+                transcript = transcript.split(")", 1)[1].strip()
+
+            processor = self.model.processor
+            if processor is None:
+                raise RuntimeError("The configured model adapter has no processor.")
+            target_ids = processor.tokenizer(
+                transcript,
+                add_special_tokens=False,
+                return_tensors="pt"
+            )["input_ids"]
+            if target_ids.numel() == 0:
+                raise ValueError(
+                    f"Transcript for sample {line_parsed.sample_id} produced no tokens"
+                )
+
+            passk_summary = Experiments.eval_passk(
+                logger=self.logger,
+                run_name=task_name,
+                lens_cache=self.model.lens_cache,
+                passk_cache=passk_results,
+                ans_token=int(target_ids[0, 0].item()),
+                k_values=k_values,
+                layer=layer,
+            )
+
+        if passk_summary is None:
+            raise RuntimeError("Pass@k evaluation did not process any prompts")
+
+        report_path = os.path.join(output_root, f"{task_name}_passk_auc.json")
+        report = {
+            **passk_summary,
+            "k_values": k_values,
+            "auc_x_axis": "log(k)",
+            "layer": layer,
+            "best_answer_ranks": passk_results.best_k_values,
+            "answer_probabilities": passk_results.best_probability,
+            "target_positions": passk_results.best_token_pos,
+        }
+        with open(report_path, "w", encoding="utf-8") as report_file:
+            json.dump(report, report_file, indent=2)
+        self.logger.info("Saved pass@k evaluation to %s", report_path)
+        return output_root
     
     # Inference methods
     # ---------------------------------------------------------------------------------------
@@ -289,7 +443,9 @@ class Master:
         self,
         lens_path: str,
         prompts_path: str,
+        inference_cnt: int | None = None,
         top_k: int | None = None,
+        layer: int | None = None,
         ) -> str:
         """Inference the Jlens on the given prompt set.
 
@@ -297,21 +453,29 @@ class Master:
             lens_path (str): Path to the Jlens file.
             prompts_path (str): Path to the prompt JSONL file.
             top_k (int | None, optional): Number of top predictions to consider. 
-                The Default is at settings["inference"]["top_k"].
+                The Default is all layers.
+            inference_cnt (int | None, optional): Number of inferences to run. 
+                The Default is all prompts.
+            layer (int | None, optional): Layer of the model to apply the Jlens. 
+                The Default is at settings["inference"]["layer"].
         """
         json_lines = Parser.load_jsonl_lines(prompts_path)
         self.model.load_Jlens(lens_path= lens_path)
         
         output_root = os.path.join(
-            self.settings["inference"]["output_root"], self.run_name
+            self._model_output_root(self.settings["inference"]["output_root"]),
+            self.run_name,
         )
         os.makedirs(output_root, exist_ok=True)
         for i in range(len(json_lines)):
+            if inference_cnt is not None and i >= inference_cnt:
+                break
             self.model.apply_lens(
                 json_line = json_lines[i],
                 data_root=self._configured_data_root(),
                 save_path= output_root,
                 top_k= top_k or self.settings["inference"]["top_k"],
+                layers_available= [layer] if layer is not None else None,
                 use_Jlens= True,
                 run_name= self.run_name,
             )

@@ -1,7 +1,7 @@
 from jlens.lens import JacobianLens
 import logging
 from audio_jlens import lens as l
-from model.instance import Instance
+from model.adapters.Instance import Instance
 
 class LogitLens(l.Lens):
     """

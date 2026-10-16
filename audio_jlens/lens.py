@@ -1,6 +1,6 @@
 from abc import ABC, abstractmethod
 import logging
-from model.instance import Instance
+from model.adapters.Instance import Instance
 
 class Lens(ABC):
     @abstractmethod
