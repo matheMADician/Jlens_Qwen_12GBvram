@@ -1,8 +1,14 @@
-from collections.abc import Sequence, Callable
+from collections.abc import Mapping, Sequence, Callable
 import os
 
 import torch
 from torch import Tensor, empty, stack
+
+"""
+MathTools provides 
+    1. math methods that doesn't involve matrix operations.
+    2. Drawing methods
+"""
 
 class MathTools:
     
@@ -203,3 +209,83 @@ class MathTools:
         figure.savefig(png_path, dpi=200)
         plt.close(figure)
         
+    @staticmethod
+    def draw_line_graph(
+        data: Mapping[str, Sequence[float] | Tensor],
+        png_path: str,
+        x_values: Sequence[float] | Tensor | None = None,
+        title: str = "Line graph",
+        x_axis_label: str = "X",
+        y_axis_label: str = "Value",
+    ) -> None:
+        """Save one or more named series as a line graph.
+
+        Args:
+            data: Mapping of legend labels to one-dimensional y-value sequences.
+            png_path: Path where the plot image will be saved.
+            x_values: Optional shared x-values. Defaults to integer positions.
+            title: Figure title.
+            x_axis_label: Horizontal axis label.
+            y_axis_label: Vertical axis label.
+        """
+        if not data:
+            raise ValueError("Line graph data must contain at least one series.")
+
+        series: dict[str, Tensor] = {}
+        expected_length: int | None = None
+        for label, values in data.items():
+            if not isinstance(label, str) or not label:
+                raise ValueError("Every line graph series must have a non-empty label.")
+            try:
+                tensor = torch.as_tensor(values, dtype=torch.float32).detach().cpu()
+            except (TypeError, ValueError) as exc:
+                raise ValueError(
+                    f"Line graph series {label!r} must contain numeric values."
+                ) from exc
+            if tensor.ndim != 1 or tensor.numel() == 0:
+                raise ValueError(
+                    f"Line graph series {label!r} must be a non-empty 1-D sequence."
+                )
+            if not torch.isfinite(tensor).all():
+                raise ValueError(
+                    f"Line graph series {label!r} contains non-finite values."
+                )
+            if expected_length is None:
+                expected_length = tensor.numel()
+            elif tensor.numel() != expected_length:
+                raise ValueError("All line graph series must have the same length.")
+            series[label] = tensor
+
+        assert expected_length is not None
+        if x_values is None:
+            x_tensor = torch.arange(expected_length, dtype=torch.float32)
+        else:
+            try:
+                x_tensor = torch.as_tensor(x_values, dtype=torch.float32).detach().cpu()
+            except (TypeError, ValueError) as exc:
+                raise ValueError("Line graph x_values must be numeric.") from exc
+            if x_tensor.ndim != 1 or x_tensor.numel() != expected_length:
+                raise ValueError(
+                    "x_values must be a 1-D sequence matching each series length."
+                )
+            if not torch.isfinite(x_tensor).all():
+                raise ValueError("Line graph x_values contain non-finite values.")
+
+        import matplotlib
+
+        matplotlib.use("Agg")
+        import matplotlib.pyplot as plt
+
+        os.makedirs(os.path.dirname(os.path.abspath(png_path)), exist_ok=True)
+        figure, axis = plt.subplots(figsize=(8, 6))
+        x = x_tensor.numpy()
+        for label, values in series.items():
+            axis.plot(x, values.numpy(), marker="o", label=label)
+        axis.set_title(title)
+        axis.set_xlabel(x_axis_label)
+        axis.set_ylabel(y_axis_label)
+        axis.grid(True, alpha=0.3)
+        axis.legend()
+        figure.tight_layout()
+        figure.savefig(png_path, dpi=200)
+        plt.close(figure)

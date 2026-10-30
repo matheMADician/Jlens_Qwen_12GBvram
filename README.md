@@ -247,12 +247,70 @@ vanilla Logit Lens baseline，並保存到另一份 cache。
 
 ### 使用 Master 執行
 
+`main.py` 使用子命令選擇要呼叫的 `Master` 方法：
+
 ```bash
-python main.py --run-name esc50-50_fleurs_en_us-50
+python main.py eval-jlens --lens-path path/to/lens.pt --prompts-path path/to/prompts.jsonl
+python main.py generate --prompts-path path/to/prompts.jsonl --max-new-tokens 128 --run-name generated
+python main.py info-jlens --lens-path path/to/lens.pt
+python main.py comp-jlens --lens-path1 path/to/lens1.pt --lens-path2 path/to/lens2.pt
+python main.py calc-jlens-experiment --run-name experiment
+python main.py test-inference
+python main.py test-training --run-name test-fit
+python main.py test-lens
 ```
 
-目前 `main.py` 會建立 `Master` 並執行 `apply_Jlens()`。在 Slurm 環境中，
-也可以使用：
+分別對應 `Master.eval_Jlens()`、`generate()`、`info_Jlens()`、`comp_Jlens()`、
+`calc_Jlens_experiment()` 和三個 testing methods。評估 JLens 時，可以用
+`--layer` 指定單一層、`--top-k` 設定 CSV 顯示的候選 token 數量，並用
+`--run-name` 指定輸出名稱；不指定 layer 時會評估所有可用層。每個 prompt
+只執行一次 `apply_lens`，同時計算 JLens 與 LogitLens 的 pass@k。CSV 同時包含兩種
+預測；JSON 報告在頂層提供 JLens 指標，並在 `logit_lens` 欄位提供 LogitLens
+指標。報告也會在 `by_layer` 下提供各層的獨立指標，並輸出
+`<run-name>_passk_auc_by_layer.png` 比較 JLens 與 LogitLens 的 normalized AUC。
+每層分數仍在該層的所有 prompt positions 中取最佳答案 token rank；因此這是
+layer-wise、但仍採 oracle-position 的結果。
+
+```bash
+python main.py eval-jlens --run-name evaluate_run --layer 22 --top-k 10
+```
+
+`generate` 會使用模型的 greedy `generate()` 對每個音訊 prompt 產生文字，
+並將 prompt、參考 transcript 和生成內容寫入
+`output/inference/<model>/<run-name>/generated.csv`。未指定 prompt 路徑時使用
+`inference.jsonl_path`；未指定生成長度時最多生成 128 個 token。
+
+`test-training` 會執行測試 fitting，並且必須提供 `--run-name`。其他使用
+`settings.json` 作為輸入的測試命令不需要額外參數。執行 `python main.py --help`
+或 `python main.py <command> --help` 可查看完整選項。
+
+若一個 Slurm job 需要連續執行多個 workflow，先建立只在該 job 使用的模型
+設定副本，再將路徑傳給每個命令。原始 `settings.json` 不會被修改：
+
+```bash
+TEMP_SETTINGS="$(mktemp)"
+trap 'rm -f "$TEMP_SETTINGS"' EXIT
+
+python main.py create-model-settings \
+  --model-name Qwen/Qwen2-Audio-7B \
+  --output-settings "$TEMP_SETTINGS"
+
+python main.py info-jlens \
+  --settings-file "$TEMP_SETTINGS" \
+  --run-name audio_analysis \
+  --lens-path output/checkpoints/Qwen2-Audio-7B/train_1_no_SAKURA/experiment/lens_full.pt
+python main.py eval-jlens \
+  --settings-file "$TEMP_SETTINGS" \
+  --run-name audio_eval \
+  --lens-path output/checkpoints/Qwen2-Audio-7B/train_1_no_SAKURA/experiment/lens_full.pt \
+  --prompts-path data/assembled/test_SAKURA_AnimalQA/prompts.jsonl
+```
+
+`Master.create_model_settings_file()` 會複製來源設定，只更新 `model.id` 與
+`model.adapter`，並寫到指定路徑。`create-model-settings` CLI 命令提供相同功能；
+model name 必須是程式目前支援的 adapter 名稱。
+
+在 Slurm 環境中，也可以使用：
 
 ```bash
 sbatch job.sh
@@ -268,13 +326,23 @@ CKA。預設使用 linear CKA，也可以指定 `mode="cos"` 使用 Jacobian mat
 的 cosine similarity。單一 JLens 會產生 layer × layer 比較；指定第二個
 checkpoint 時，會產生 `lens1 layer × lens2 layer` 比較圖。計算會在 CUDA
 可用時自動使用 GPU，否則使用 CPU；也可以透過 `device` 參數指定裝置。
+分析結果會放在
+`output/experiments/<model_name>/single_lens/<run_name>/` 或
+`output/experiments/<model_name>/two_lens/<run_name>/`。模型名稱會從
+`model.id` 自動取得。`info_Jlens()` 的 cosine、CKA 和 SVD 圖都存於
+`single_lens/`；`comp_Jlens()` 的比較表、JSON 報告、cosine similarity、
+relative difference 和 subspace alignment 圖存於 `two_lens/`。pass@k 與
+inference 輸出仍使用各自原本設定的輸出根目錄。
+
+pass@k 會在每個 prompt 的所有輸入位置中尋找答案 token 的最低排名；指定
+`layer` 時只評估該層，未指定時則在所有可用層中取最佳排名。執行
+`python main.py eval-jlens --layer <layer>` 可指定層。
 
 ```python
 from Master import Master
 
 master = Master(run_name="heatmap")
 heatmap = master.draw_Jlens_heatmap(
-  heatmap_path="output/heatmaps/jlens_comparison.png",
   lens_path1="output/checkpoints/esc50-50_fleurs_en_us-50/lens.pt",
   lens_path2="output/checkpoints/esc50-50_libri-50/lens.pt",
 )

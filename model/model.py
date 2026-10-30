@@ -1,5 +1,6 @@
 import os, logging, json, csv
 from pathlib import Path
+from tkinter.tix import MAX
 import torch
 from torch import Tensor
 
@@ -9,7 +10,7 @@ from model.adapters.qwen25_omni import Instance as Qwen25OmniInstance
 from model.adapters.qwen2_audio import Instance as Qwen2AudioInstance
 from jacobian_lens.jlens.lens import JacobianLens
 
-
+# The available models.
 MODEL_ADAPTERS: dict[str, type[Instance]] = {
     "Qwen/Qwen2.5-Omni-7B": Qwen25OmniInstance,
     "Qwen/Qwen2-Audio-7B": Qwen2AudioInstance,
@@ -17,6 +18,16 @@ MODEL_ADAPTERS: dict[str, type[Instance]] = {
 
 
 class LensOutputCache:
+    CSV_FIELDNAMES: tuple[str, ...] = (
+        "position",
+        "layer",
+        "input_token",
+        "top_k_Jlens",
+        "top_k_LogitLens",
+        "other_info_Jlens",
+        "other_info_LogitLens",
+    )
+
     """
     * Cache for the latest JLens and LogitLens outputs.
     * Each output is stored as:
@@ -87,6 +98,21 @@ class LensOutputCache:
             output_path = output_path.with_suffix(".csv")
         output_path.parent.mkdir(parents=True, exist_ok=True)
 
+        rows = self.to_rows(top_k=top_k)
+        write_header = not output_path.exists() or output_path.stat().st_size == 0
+        # utf-8-sig keeps the file UTF-8 while allowing Excel to detect it.
+        with output_path.open("a", newline="", encoding="utf-8-sig") as output_file:
+            writer = csv.DictWriter(output_file, fieldnames=self.CSV_FIELDNAMES)
+            if write_header:
+                writer.writeheader()
+            writer.writerows(rows)
+        return str(output_path)
+
+    def to_rows(self, top_k: int = 5) -> list[dict[str, object]]:
+        """Format cached logits as CSV-compatible prediction rows."""
+        if top_k < 1:
+            raise ValueError("top_k must be at least 1")
+
         cached = []
         if self.jlens_data is not None:
             cached.append(("jlens", self.jlens_data))
@@ -114,78 +140,65 @@ class LensOutputCache:
                 layer_names.add(layer)
             prepared[lens_type] = (input_ids, prepared_layers)
 
-        fieldnames = [
-            "position",
-            "layer",
-            "input_token",
-            "top_k_Jlens",
-            "top_k_LogitLens",
-            "other_info_Jlens",
-            "other_info_LogitLens",
-        ]
-
-        write_header = not output_path.exists() or output_path.stat().st_size == 0
-        # utf-8-sig keeps the file UTF-8 while allowing Excel to detect it.
-        with output_path.open("a", newline="", encoding="utf-8-sig") as output_file:
-            writer = csv.DictWriter(output_file, fieldnames=fieldnames)
-            if write_header:
-                writer.writeheader()
-            input_ids = next(iter(prepared.values()))[0]
-            prepared_by_layer = {
-                lens_type: {
-                    layer: (top_probs, top_ids, entropy)
-                    for layer, top_probs, top_ids, entropy in prepared_layers
-                }
-                for lens_type, (_, prepared_layers) in prepared.items()
+        input_ids = next(iter(prepared.values()))[0]
+        prepared_by_layer = {
+            lens_type: {
+                layer: (top_probs, top_ids, entropy)
+                for layer, top_probs, top_ids, entropy in prepared_layers
             }
-            n_positions = max(
-                tensor.shape[0]
-                for _, prepared_layers in prepared.values()
-                for _, tensor, _, _ in prepared_layers
-            )
-            for position in range(n_positions):
-                input_token = ""
-                if position < len(input_ids):
-                    input_token = self._decode_token(int(input_ids[position]))
-                for layer in sorted(
-                    layer_names,
-                    key=lambda value: (value == "model", int(value) if value != "model" else 0),
+            for lens_type, (_, prepared_layers) in prepared.items()
+        }
+        n_positions = max(
+            tensor.shape[0]
+            for _, prepared_layers in prepared.values()
+            for _, tensor, _, _ in prepared_layers
+        )
+        rows: list[dict[str, object]] = []
+        for position in range(n_positions):
+            input_token = ""
+            if position < len(input_ids):
+                input_token = self._decode_token(int(input_ids[position]))
+            for layer in sorted(
+                layer_names,
+                key=lambda value: (
+                    value == "model",
+                    int(value) if value != "model" else 0,
+                ),
+            ):
+                row: dict[str, object] = {
+                    "position": position,
+                    "layer": layer,
+                    "input_token": input_token,
+                }
+                for lens_type, column_suffix in (
+                    ("jlens", "Jlens"),
+                    ("logit_lens", "LogitLens"),
                 ):
-                    row = {
-                        "position": position,
-                        "layer": layer,
-                        "input_token": input_token,
-                    }
-                    for lens_type, column_suffix in (
-                        ("jlens", "Jlens"),
-                        ("logit_lens", "LogitLens"),
-                    ):
-                        values = prepared_by_layer.get(lens_type, {}).get(layer)
-                        if values is None or position >= values[1].shape[0]:
-                            row[f"top_k_{column_suffix}"] = ""
-                            row[f"other_info_{column_suffix}"] = ""
-                            continue
-                        top_probs, top_ids, entropy = values
-                        token_text = [
-                            self._decode_token(token_id)
-                            for token_id in top_ids[position].tolist()
-                        ]
-                        row[f"top_k_{column_suffix}"] = json.dumps(
-                            token_text,
-                            ensure_ascii=False,
-                        )
-                        row[f"other_info_{column_suffix}"] = json.dumps(
-                            {
-                                "top_tokens": token_text,
-                                "top_k_probability": float(top_probs[position].sum()),
-                                "top_probability": float(top_probs[position, 0]),
-                                "entropy": float(entropy[position]),
-                            },
-                            ensure_ascii=False,
-                        )
-                    writer.writerow(row)
-
-        return str(output_path)
+                    values = prepared_by_layer.get(lens_type, {}).get(layer)
+                    if values is None or position >= values[1].shape[0]:
+                        row[f"top_k_{column_suffix}"] = ""
+                        row[f"other_info_{column_suffix}"] = ""
+                        continue
+                    top_probs, top_ids, entropy = values
+                    token_text = [
+                        self._decode_token(token_id)
+                        for token_id in top_ids[position].tolist()
+                    ]
+                    row[f"top_k_{column_suffix}"] = json.dumps(
+                        token_text,
+                        ensure_ascii=False,
+                    )
+                    row[f"other_info_{column_suffix}"] = json.dumps(
+                        {
+                            "top_tokens": token_text,
+                            "top_k_probability": float(top_probs[position].sum()),
+                            "top_probability": float(top_probs[position, 0]),
+                            "entropy": float(entropy[position]),
+                        },
+                        ensure_ascii=False,
+                    )
+                rows.append(row)
+        return rows
 
     def _decode_token(self, token_id: int) -> str:
         if self.tokenizer is None:
@@ -318,6 +331,8 @@ class Model:
         model = self.load_model()
         return model, model.processor
 
+    # Jlens methods
+    # ----------------------------------------------------------------------
     def get_lens_output(self) -> LensOutputCache:
         return self.lens_cache
 
@@ -515,6 +530,8 @@ class Model:
         if save_path is not None:
             self.lens_cache.save(save_path= save_path, run_name= run_name, top_k= top_k)
 
+    # Prompt encoding and inference methods
+    # ----------------------------------------------------------------------
     def encode_prompt(self, json_line: str, MAX_LENGTH: int = 300):
         return self.load_model().encode(text=json_line, max_length=MAX_LENGTH)
         
@@ -535,6 +552,23 @@ class Model:
             )
         )
          
+    def generate(
+        self,
+        jsonl_line: str,
+        data_root: str,
+        max_new_tokens: int = 128,
+        max_input_length: int = 3000,
+    ) -> str:
+        """Generate a greedy text response for one audio prompt."""
+        model = self.load_model()
+        model.load_data(data_root=data_root)
+        input_ids = model.encode(jsonl_line, max_length=max_input_length)
+        return model.generate(
+            input_ids,
+            max_new_tokens=max_new_tokens,
+        )
+    # Experimental methods
+    # ----------------------------------------------------------------------
     def _token_directions(self, token_id: int, layers: list[int]) -> dict[int, torch.Tensor]:
         """
         * Unit direction of token_id in the residual space of each layer: d_l = J_l^T u,

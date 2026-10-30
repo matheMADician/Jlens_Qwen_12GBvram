@@ -6,6 +6,10 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 .ipynb_checkpoints/
+/jobs/*
+
+# Testing files from Copilot
+/tester/*
 
 # Local datasets and downloaded audio
 /data/assembled/

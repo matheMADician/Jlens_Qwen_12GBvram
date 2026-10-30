@@ -75,6 +75,8 @@ class Instance(LensModel):
     def clear_model_input_cache(self) -> None:
         raise NotImplementedError("Subclasses must clear their cached model inputs.")
 
+    # Protocol methods
+    # ----------------------------------------------------------------------
     def encode(self, text: str, *, max_length: int= 3000) -> Tensor:
         """Encodes the input text into a tensor suitable for the model.
         For multi-model purposes, text should be the raw jsonl line.
@@ -87,6 +89,54 @@ class Instance(LensModel):
     def unembed(self, residual: Tensor) -> Tensor:
         raise NotImplementedError("Subclasses must implement the output readout.")
 
+    def generate(self, prompt: Tensor, max_new_tokens: int = 128) -> str:
+        """Greedily generate text using the encoded multimodal inputs."""
+        if max_new_tokens < 1:
+            raise ValueError("max_new_tokens must be at least 1")
+        if prompt.ndim != 2:
+            raise ValueError(
+                f"prompt expected [batch, seq_len], got {tuple(prompt.shape)}"
+            )
+        if prompt.shape[0] != 1:
+            raise ValueError("generate() currently supports one prompt at a time.")
+
+        model, _ = self.get_model()
+        model_inputs = getattr(self, "cached_model_inputs", None)
+        if not isinstance(model_inputs, dict) or "input_ids" not in model_inputs:
+            raise RuntimeError("generate() requires encoded inputs from encode().")
+
+        cached_input_ids = model_inputs["input_ids"]
+        if not torch.is_tensor(cached_input_ids) or prompt.shape != cached_input_ids.shape:
+            raise ValueError("prompt shape does not match the cached encoded inputs.")
+
+        generation_inputs = dict(model_inputs)
+        generation_inputs["input_ids"] = prompt
+        generate = getattr(model, "generate", None)
+        if not callable(generate):
+            raise RuntimeError("The configured model does not provide generate().")
+
+        with torch.inference_mode():
+            sequences = generate(
+                **generation_inputs,
+                max_new_tokens=max_new_tokens,
+                do_sample=False,
+                num_beams=1,
+                return_dict_in_generate=False,
+            )
+        if not torch.is_tensor(sequences) or sequences.ndim != 2:
+            raise RuntimeError("Model generate() returned an unexpected output.")
+
+        generated_ids = sequences[:, prompt.shape[1] :]
+        if self.tokenizer is None:
+            raise RuntimeError("The configured model adapter has no tokenizer.")
+        return self.tokenizer.batch_decode(
+            generated_ids,
+            skip_special_tokens=True,
+            clean_up_tokenization_spaces=False,
+        )[0].strip()
+
+    # Experimental methods
+    # ----------------------------------------------------------------------
     def get_unembedding_direction(self, token_id: int) -> Tensor:
         raise NotImplementedError("Subclasses must implement token directions for ablation.")
 
@@ -162,3 +212,6 @@ class Instance(LensModel):
             return patched if torch.is_tensor(output) else (patched, *output[1:])
 
         return hook
+
+    # Other methods
+    # ----------------------------------------------------------------------

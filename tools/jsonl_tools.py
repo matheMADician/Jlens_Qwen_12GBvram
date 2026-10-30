@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-import json
+import json, os
 from pathlib import Path
 from typing import Any
 
@@ -27,3 +27,11 @@ def load_jsonl(path: Path) -> list[dict[str, Any]]:
 				)
 			records.append(record)
 	return records
+
+def write_jsonl(path: Path, records: list[dict[str, Any]]) -> None:
+	"""Write a list of dictionaries to a JSONL file."""
+	os.makedirs(path.parent, exist_ok=True)
+	with path.open("w", encoding="utf-8") as handle:
+		for record in records:
+			json_line = json.dumps(record, ensure_ascii=False)
+			handle.write(json_line + "\n")

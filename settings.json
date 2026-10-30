@@ -1,12 +1,12 @@
 {
     "model": {
-        "id": "Qwen/Qwen2-Audio-7B",
-        "adapter": "Qwen/Qwen2-Audio-7B",
+        "id": "Qwen/Qwen2.5-Omni-7B",
+        "adapter": "Qwen/Qwen2.5-Omni-7B",
         "load_in_4bit": false
     },
     "fitting": {
         "root": "data",
-        "jsonl_path": "data/assembled/train_1_no_SAKURA/prompts.jsonl",
+        "jsonl_path": "data/assembled/train_2_no_SAKURA/prompts.jsonl",
         "max_seq_len": 3000,
         "dim_batch": 32,
         "checkpoint_interval": 5,
@@ -28,7 +28,7 @@
     "experiment": {
         "matrix_analysis": {
             "SVD_top_k": 8,
-            "output_root": "output/heatmaps"
+            "output_root": "output/experiments"
         },
         "pass_k_AUC": {
             "k_values": [1, 2, 4, 8, 16, 32, 64, 128, 256],

@@ -1,5 +1,7 @@
-from jlens.lens import JacobianLens
 import os, logging
+from torch import Tensor
+
+from jlens.lens import JacobianLens
 from audio_jlens import lens as l
 from audio_jlens.subset_fitting import subset_fit
 from model.adapters.Instance import Instance
@@ -237,6 +239,11 @@ class Jlens(l.Lens):
             self.logger.info(f"Successfully loaded lens from {checkpoint_path}")
         except Exception as e:
             raise RuntimeError(f"Failed loading lens from {checkpoint_path}({e}).")
+
+    def get_jacobian(self) -> dict[int, Tensor]:
+        if self.lens is None:
+            raise ValueError("No lens loaded.")
+        return self.lens.jacobians
 
     def get_J_vector(self, layer: int, token: int):
         assert self.lens is not None

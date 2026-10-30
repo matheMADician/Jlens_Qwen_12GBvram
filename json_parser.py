@@ -24,6 +24,7 @@ class Parser:
         """
         * Accepts the absolute path to the jsonl file.
         * Parses the jsonl file into lines.
+        * Raises a ValueError if the file contains no valid lines.
         """
         if not os.path.isfile(path):
             raise RuntimeError(f"Json file does not exist({path})")
@@ -33,6 +34,8 @@ class Parser:
                 raw = raw.strip()
                 if raw:
                     lines.append(raw)
+        if not lines:
+            raise ValueError(f"JsonL file contains no valid lines: {path}")
         return lines
 
     @staticmethod
