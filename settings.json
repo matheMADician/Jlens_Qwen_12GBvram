@@ -6,16 +6,22 @@
     },
     "fitting": {
         "root": "data",
-        "jsonl_path": "data/assembled/train_2_no_SAKURA/prompts.jsonl",
+        "jsonl_path": "data/assembled/train_upscale_1/prompts.jsonl",
         "max_seq_len": 3000,
         "dim_batch": 32,
         "checkpoint_interval": 5,
         "checkpoint_root": "output/checkpoints",
         "experiment": {
-            "seed": 1145141919810,
+            "seed": 42,
             "mode": null,
-            "max_prompts": 50,
-            "save_prompt_count": [1, 5, 10, 50],
+            "max_prompts": 1000000,
+            "save_prompt_count": [1, 5, 10, 50, 100, 500],
+            "random_projection": true,
+            "projection_dim_seed": [[128, 42]],
+            "save_projected_features": true,
+            "save_dataset_lenses": true,
+            "save_milestone_lenses": true,
+            "tsne_perplexity": 30.0,
             "is_test": false
         }
     },

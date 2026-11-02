@@ -271,6 +271,40 @@ python main.py test-lens
 每層分數仍在該層的所有 prompt positions 中取最佳答案 token rank；因此這是
 layer-wise、但仍採 oracle-position 的結果。
 
+`calc-jlens-experiment` 可在 `settings.json` 的 `fitting.experiment` 中設定
+`random_projection: true` 來啟用投影與 t-SNE；預設為 `false`。
+`save_dataset_lenses` 和 `save_milestone_lenses` 可分別控制是否寫出
+`datasets/` 內的 per-dataset lens 與 `milestones/` 內的累積 lens，兩者預設皆為
+`true`。也可在命令列使用 `--no-save-dataset-lenses` 或
+`--no-save-milestone-lenses` 暫時停用；這只控制檔案輸出，函式仍會回傳計算出的
+lens，也不會停用 t-SNE 所需的 projected feature 輸出。若恢復 fitting，
+milestone 儲存選項必須與 checkpoint 一致。
+`projection_dim_seed` 是 `[維度, seed]` 配對的清單，預設為 `[[128, 42]]`，
+命令列也可用 `--projector DIM:SEED` 覆寫，並為不同 projector 各自執行
+長 fitting。`save_projected_features` 預設為 `true`；可用
+`--no-save-projected-features` 只保存投影後的 aggregate lenses，不跑 t-SNE。
+`tsne_perplexity` 預設為 `30.0`；
+樣本數不足時會自動降低到有效範圍。
+啟用此功能的 Python 環境需安裝 `scikit-learn`。
+
+啟用後，`output/checkpoints/<model>/<run-name>/experiment/` 會保留完整大小的
+`datasets/` lens，以及供 pass@k 評估使用的完整大小 `milestones/` lens；
+每個 projector 的投影結果獨立放在
+`projected/dim_<dimension>_seed_<seed>/`，內含 projected combined lens、
+實際使用的 `projection_matrix.npz`、每個 dataset 一個壓縮 `.npz`，以及
+`tsne.png` 和 `tsne_embedding.npz`。dataset 檔案包含每個 prompt 跨 source
+layers 串接後的投影 features、prompt ID、dataset label 和投影 metadata。
+per-prompt features 會逐筆寫入 projector 的暫存 cache，支援跨 server time limit
+resume；完成 fitting 後合併成 dataset `.npz`，t-SNE 成功後刪除這些大型原始
+features，只保留 embedding、圖、投影矩陣和 projected combined lens。
+每次啟用 per-prompt features 時請只選一個 projector，並為不同 dimension/seed
+使用不同 `--run-name`：
+
+```bash
+python main.py calc-jlens-experiment --run-name qwen-p128-s42 --projector 128:42
+python main.py calc-jlens-experiment --run-name qwen-p256-s42 --projector 256:42
+```
+
 ```bash
 python main.py eval-jlens --run-name evaluate_run --layer 22 --top-k 10
 ```

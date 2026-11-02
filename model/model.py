@@ -8,12 +8,16 @@ from audio_jlens import jlens as J, lens, logitLens as L
 from model.adapters.Instance import AblationSpec, Instance
 from model.adapters.qwen25_omni import Instance as Qwen25OmniInstance
 from model.adapters.qwen2_audio import Instance as Qwen2AudioInstance
+from model.adapters.qwen2_audio_instruct import (
+    Instance as Qwen2AudioInstructInstance,
+)
 from jacobian_lens.jlens.lens import JacobianLens
 
 # The available models.
 MODEL_ADAPTERS: dict[str, type[Instance]] = {
     "Qwen/Qwen2.5-Omni-7B": Qwen25OmniInstance,
     "Qwen/Qwen2-Audio-7B": Qwen2AudioInstance,
+    "Qwen/Qwen2-Audio-7B-Instruct": Qwen2AudioInstructInstance,
 }
 
 
@@ -401,25 +405,28 @@ class Model:
         data_root: str | None = None,
         checkpoint_interval: int = 5,
         max_prompts: int | None = None,
+        random_projection: bool = False,
+        projection_dim_seed: list[list[int]] | None = None,
+        save_projected_features: bool = True,
+        save_dataset_lenses: bool = True,
+        save_milestone_lenses: bool = True,
     ) -> tuple[JacobianLens, dict[str, JacobianLens], dict[int, JacobianLens]]:
         """Fit and save Jacobian lenses for data-size and per-dataset experiments.
 
         `max_prompts`, when set, caps the deterministically shuffled input
         records before fitting.
 
-        Saves:
-          1. One JacobianLens for each dataset.
-          2. Progressive cumulative JacobianLens snapshots at each milestone count
-             in `save_prompt_count` (e.g. [1, 2, 5, 10, 20, 50, ...]).
-          3. Final combined lens across all processed samples.
+        Saves full-size dataset lenses and cumulative/combined lenses according
+        to their respective switches. When ``random_projection`` is enabled,
+        cumulative/combined lenses are saved as projections, and per-prompt
+        projected features are saved for t-SNE.
 
         Binds the combined lens to `self.lens`.
         """
         from json_parser import Parser
         from audio_jlens.subset_fitting import subset_fit_experiment
 
-        if not os.path.isfile(jsonl_path):
-            raise RuntimeError(f"Jsonl file({jsonl_path}) does not exist.")
+        records_str: list[str] = Parser.load_jsonl_lines(jsonl_path)
 
         parent_dir, _ = os.path.split(jsonl_path)
         audio_root = data_root if data_root is not None else parent_dir
@@ -427,7 +434,6 @@ class Model:
         model = self.load_model()
         model.load_data(audio_root)
 
-        records_str: list[str] = Parser.load_jsonl_lines(jsonl_path)
         if is_test:
             records_str = records_str[: min(5, len(records_str))]
         self.logger.info("Loaded %d raw sample records from %s", len(records_str), jsonl_path)
@@ -457,6 +463,34 @@ class Model:
 
         os.makedirs(output_dir, exist_ok=True)
 
+        # Create Gaussian random projectors
+        if random_projection:
+            if not projection_dim_seed:
+                raise ValueError(
+                    "projection_dim_seed must contain at least one "
+                    "[projection_dim, seed] pair when random projection is enabled."
+                )
+            if any(
+                not isinstance(pair, (list, tuple)) or len(pair) != 2
+                for pair in projection_dim_seed
+            ):
+                raise ValueError(
+                    "Each projection_dim_seed entry must be a "
+                    "[projection_dim, seed] pair."
+                )
+            from audio_jlens.random_proj import GaussianRandomProjector as GP
+
+            projectors: list[GP] | None = [
+                GP(
+                    d_model=model.d_model,
+                    projection_dim=projection_dim,
+                    seed=projector_seed,
+                )
+                for projection_dim, projector_seed in projection_dim_seed
+            ]
+        else:
+            projectors = None
+
         combined_lens, dataset_lenses, milestone_lenses = subset_fit_experiment(
             model=model,
             prompts=records_str,
@@ -474,6 +508,10 @@ class Model:
             max_prompts=max_prompts,
             processor=model.processor,
             data_root=audio_root,
+            projectors=projectors,
+            save_projected_features=save_projected_features,
+            save_dataset_lenses=save_dataset_lenses,
+            save_milestone_lenses=save_milestone_lenses,
         )
 
         # Bind the combined lens to self.lens

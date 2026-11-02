@@ -24,11 +24,36 @@ removed because they are excluded by the original next-token estimator.
 
 The returned ``J_l`` has shape ``[d_model, d_model]`` and is compatible with
 the external ``JacobianLens`` class.
+
+Call tree:
+    subset_fit_experiment
+    ├── shuffle prompts; optionally cap the input
+    ├── for each prompt
+    │   ├── Parser.parse_json_line
+    │   ├── _compute_single_prompt_jacobian
+    │   │   ├── mode=None: jacobian_for_prompt
+    │   │   └── subset mode
+    │   │       ├── _text_suffix_token_count
+    │   │       ├── SubsetConfig: select source/target token positions
+    │   │       └── subset_jacobian_for_prompt
+    │   ├── accumulate combined and per-dataset Jacobian sums
+    │   ├── optionally cache projected per-prompt features
+    │   └── optionally save a cumulative milestone lens
+    ├── save dataset lenses and consolidated projected features
+    └── save combined lens, metadata, and final checkpoint
+
+    subset_fit
+    ├── mode=None: delegate the full fit to jacobian_lens.fitting.fit
+    └── subset mode
+        ├── for each prompt: _compute_single_prompt_jacobian
+        ├── accumulate the running Jacobian sum
+        └── save or resume the fit checkpoint
 """
 import logging, math, os, time
 from collections.abc import Sequence
 from typing import Any
 import torch
+from audio_jlens.random_proj import GaussianRandomProjector as GP
 
 logger = logging.getLogger(__name__)
 
@@ -255,6 +280,7 @@ def subset_jacobian_for_prompt(
 
 def _compute_single_prompt_jacobian(
     model: LensModel,
+    processor: Any,
     prompt: str,
     mode: str | None,
     source_layers: Sequence[int],
@@ -262,11 +288,11 @@ def _compute_single_prompt_jacobian(
     dim_batch: int,
     skip_first: int,
     effective_max_seq_len: int,
-    processor: Any | None,
     data_root: str | None,
 ) -> tuple[dict[int, torch.Tensor], int, int]:
     """Helper to encode a single prompt and compute its per-layer Jacobian."""
     if mode is None:
+        # Calls the unmodified function.
         return jacobian_for_prompt(
             model=model,
             prompt=prompt,
@@ -276,9 +302,6 @@ def _compute_single_prompt_jacobian(
             max_seq_len=effective_max_seq_len,
             skip_first=skip_first,
         )
-
-    if processor is None:
-        raise ValueError("processor is required when fitting a subset mode")
 
     input_ids = model.encode(prompt, max_length=effective_max_seq_len)
     prompt_count = input_ids.shape[1]
@@ -308,74 +331,137 @@ def _compute_single_prompt_jacobian(
         skip_first=skip_first,
     )
 
-
 def subset_fit_experiment(
     model: LensModel,
+    processor: Any,
     prompts: Sequence[str],
+    data_root: str,
     seed: int,
+    output_dir: str,
+    checkpoint_path: str,
+    checkpoint_every: int | None = 1,
     mode: str | None = None,
     save_prompt_counts: Sequence[int] | None = None,
     source_layers: Sequence[int] | None = None,
     target_layer: int | None = None,
     dim_batch: int = 8,
-    max_seq_len: int | None = 128,
+    max_seq_len: int = 3000,
     skip_first: int = SKIP_FIRST_N_POSITIONS,
-    output_dir: str | None = None,
-    checkpoint_path: str | None = None,
-    checkpoint_every: int | None = 1,
     resume: bool = True,
     max_prompts: int | None = None,
     *,
-    processor: Any | None = None,
-    data_root: str | None = None,
+    projectors: list[GP] | None = None,
+    save_projected_features: bool = True,
+    save_dataset_lenses: bool = True,
+    save_milestone_lenses: bool = True,
 ) -> tuple[JacobianLens, dict[str, JacobianLens], dict[int, JacobianLens]]:
-    """Fit Jacobian lenses for dataset and data-size scaling experiments.
+    """Fit combined, per-dataset, and cumulative Jacobian lenses in one pass.
 
-    Computes per-layer Jacobians in a single pass over a deterministically
-    shuffled sequence of prompts. Simultaneously accumulates:
-      1. Running cumulative sum to save milestone lenses at counts in `save_prompt_counts`.
-      2. Per-dataset sums to save an individual lens for each dataset.
+    Prompts are shuffled deterministically with ``seed`` and then limited by
+    ``max_prompts``, if supplied. Each valid prompt contributes its Jacobians
+    to the combined and dataset-specific means. Milestone means are captured
+    after the requested number of successfully processed prompts. Prompts that
+    raise ``ValueError`` or ``OSError`` during parsing or fitting are logged
+    and skipped.
+
+    ``mode=None`` uses the ordinary Jacobian estimator. The subset modes
+    ``"S2T"``, ``"S2S"``, ``"T2T"``, and ``"S&T2T"`` select source and target
+    token positions relative to the text suffix of the formatted audio chat
+    prompt; these modes require ``processor``.
+
+    Fitting state is checkpointed atomically and can resume from
+    ``checkpoint_path``. Resume validates source layers, target layer,
+    ``skip_first``, shuffle seed, prompt cap, projector configuration,
+    projected-feature setting, and milestone-save setting against the
+    checkpoint. With projected-feature saving enabled, each prompt's
+    projected Jacobians are flattened and concatenated across source layers,
+    then written as durable shards for resuming and later per-dataset
+    consolidation.
+
+    Lens saving switches only control files: dataset and milestone lenses are
+    still computed and returned when their corresponding saving option is
+    false. The combined lens and fit metadata are always saved to
+    ``output_dir``. If projectors are supplied, the projection matrix and
+    projected combined lens are saved separately from full-size milestone
+    lenses. Saving per-prompt projected features requires exactly one
+    projector.
 
     Args:
-        model: The model to fit on.
-        prompts: Raw JSONL lines.
-        seed: Random seed for deterministic shuffling.
-        mode: Token subset mode ("S2T", "S2S", "T2T", "S&T2T", or None).
-        save_prompt_counts: List of prompt counts (e.g. [1, 2, 5, 10, ...]) at which
-            to save cumulative lenses.
-        max_prompts: Optional cap on the number of prompts fitted. The cap is
-            applied after deterministic shuffling so it does not select only
-            the beginning of the input file.
-        source_layers: Layer indices to compute J_l at.
-        target_layer: Target layer for gradients.
-        dim_batch: Batch size for Jacobian output dimensions.
-        max_seq_len: Maximum prompt length.
-        skip_first: Number of initial tokens to skip.
-        output_dir: Directory where milestone and per-dataset lenses and metadata are stored.
-        checkpoint_path: Path for saving resumable fit state.
-        checkpoint_every: Interval for checkpoint saving.
-        resume: Whether to resume from checkpoint_path if it exists.
-        processor: Processor for multimodal chat prompt templating.
-        data_root: Root path to resolve audio files.
+        model: Model whose activations and Jacobians are used for fitting.
+        processor: Multimodal processor used to format audio-chat prompts;
+            required when ``mode`` selects token subsets.
+        prompts: Input records, one JSONL string per prompt.
+        data_root: Root directory used to resolve audio paths in each record.
+        seed: Seed for the deterministic prompt shuffle; it must match the
+            checkpoint when resuming.
+        output_dir: Directory for the combined lens, metadata, optional dataset
+            and milestone lenses, and optional projected artifacts.
+        checkpoint_path: Path to the resumable fitting-state checkpoint.
+        checkpoint_every: Save intermediate state after this many input
+            positions. The final state is saved when fitting completes;
+            ``None`` disables intermediate checkpoint writes.
+        mode: Jacobian token-subset mode: ``"S2T"`` (source before the text
+            suffix, target within it), ``"S2S"`` (all prompt positions for
+            source and target), ``"T2T"`` (text suffix for both), ``"S&T2T"``
+            (all source positions and text-suffix target positions), or
+            ``None`` for ordinary fitting.
+        save_prompt_counts: Successful-prompt counts at which to compute and
+            return cumulative milestone lenses. Defaults to no milestones.
+        source_layers: Model layers at which to compute Jacobians; defaults to
+            the layers selected by the fitting layer validator.
+        target_layer: Layer differentiated to compute Jacobians; defaults to
+            the final layer as resolved by the fitting layer validator.
+        dim_batch: Number of Jacobian output dimensions computed in each
+            backward pass.
+        max_seq_len: Maximum encoded prompt length passed to the model.
+        skip_first: Number of leading token positions excluded by the Jacobian
+            estimator.
+        resume: If true and ``checkpoint_path`` exists, restore its fit state
+            and continue from the next shuffled prompt.
+        max_prompts: Optional maximum number of shuffled input records to fit.
+            This cap is applied after shuffling.
+        projectors: Optional unique random-projection configurations. Their
+            matrices and projected aggregate lenses are saved under
+            ``output_dir/projected``.
+        save_projected_features: If true, persist a projected feature vector
+            for each successfully fitted prompt for downstream t-SNE
+            visualization. Requires exactly one projector.
+        save_dataset_lenses: Save one full-dimensional lens file per dataset
+            under ``output_dir/datasets`` (default true).
+        save_milestone_lenses: Save full-size cumulative lens files at
+            ``save_prompt_counts`` under ``output_dir/milestones`` (default
+            true), regardless of whether projectors are supplied.
 
     Returns:
-        (combined_lens, dataset_lenses, milestone_lenses)
+        A tuple containing the combined lens, a mapping from normalized
+        dataset name to its lens, and a mapping from successful-prompt count
+        to each computed milestone lens. Dataset and milestone mappings are
+        populated independently of their file-saving switches.
     """
     import random
-
-    if max_prompts is not None and (
-        not isinstance(max_prompts, int)
-        or isinstance(max_prompts, bool)
-        or max_prompts <= 0
-    ):
-        raise ValueError("max_prompts must be a positive integer or None")
-
-    effective_max_seq_len = max_seq_len if max_seq_len is not None else 3000
 
     n_layers, d_model = model.n_layers, model.d_model
     source_layers, target_layer = _check_layer_indices(
         source_layers, target_layer, n_layers
     )
+
+    if projectors is not None:
+        if not projectors:
+            raise ValueError("projectors must be non-empty when provided.")
+        # Since the projected features still take up a substantial amount of memory,
+            # we ensure that when projected features are saved, only one projector is used per run.
+            # If you have a lot of RAM and Disc space, this check can be relaxed.
+        if save_projected_features and len(projectors) != 1:
+            raise ValueError(
+                "Per-prompt feature saving requires exactly one projector per fit."
+            )
+        if any(projector.d_model != d_model for projector in projectors):
+            raise ValueError("Every projector d_model must match the model d_model.")
+        projector_names = [projector.name for projector in projectors]
+        if len(set(projector_names)) != len(projector_names):
+            raise ValueError(
+                "Projector dimension/seed configurations must be unique."
+            )
 
     # Deterministically shuffle prompts using a dedicated Random instance
     total_prompts_input = len(prompts)
@@ -395,12 +481,24 @@ def subset_fit_experiment(
     sorted_milestones = sorted(set(save_prompt_counts)) if save_prompt_counts else []
 
     # Directories for saving artifacts
-    milestones_dir = os.path.join(output_dir, "milestones") if output_dir else None
-    datasets_dir = os.path.join(output_dir, "datasets") if output_dir else None
+    milestones_dir = (
+        os.path.join(output_dir, "milestones")
+        if output_dir and save_milestone_lenses
+        else None
+    )
+    datasets_dir = (
+        os.path.join(output_dir, "datasets")
+        if output_dir and save_dataset_lenses
+        else None
+    )
+    projected_root = os.path.join(output_dir, "projected") if output_dir and projectors else None
+
     if milestones_dir:
         os.makedirs(milestones_dir, exist_ok=True)
     if datasets_dir:
         os.makedirs(datasets_dir, exist_ok=True)
+    if projected_root:
+        os.makedirs(projected_root, exist_ok=True)
 
     # State containers
     total_jacobian_sum: dict[int, torch.Tensor] = {
@@ -412,62 +510,127 @@ def subset_fit_experiment(
     next_idx: int = 0
     saved_milestones: set[int] = set()
     milestone_lenses: dict[int, JacobianLens] = {}
+    projection_cache_available = projectors is not None and save_projected_features
+    fit_complete = False
 
-    if resume:
-        if checkpoint_path is None:
-            raise ValueError("checkpoint_path must be specified when resuming.")
-        if os.path.exists(checkpoint_path):
-            state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
-            for key, expected in (
-                ("source_layers", source_layers),
-                ("target_layer", target_layer),
-                ("skip_first", skip_first),
-                ("seed", seed),
-            ):
-                if key in state and state[key] != expected:
-                    raise ValueError(
-                        f"checkpoint at {checkpoint_path} was fitted with {key}="
-                        f"{state.get(key)!r}, not {expected!r}; pass resume=False to discard it"
-                    )
-            if state.get("max_prompts") != max_prompts:
+    if resume and os.path.exists(checkpoint_path):
+        state = torch.load(checkpoint_path, map_location="cpu", weights_only=True)
+        for key, expected in (
+            ("source_layers", source_layers),
+            ("target_layer", target_layer),
+            ("skip_first", skip_first),
+            ("seed", seed),
+        ):
+            if key in state and state[key] != expected:
                 raise ValueError(
-                    f"checkpoint at {checkpoint_path} was fitted with max_prompts="
-                    f"{state.get('max_prompts')!r}, not {max_prompts!r}; "
-                    "pass resume=False to discard it"
+                    f"checkpoint at {checkpoint_path} was fitted with {key}="
+                    f"{state.get(key)!r}, not {expected!r}; pass resume=False to discard it"
                 )
-            total_jacobian_sum = state["total_jacobian_sum"]
-            dataset_jacobian_sums = state["dataset_jacobian_sums"]
-            dataset_counts = state["dataset_counts"]
-            total_done = state["total_done"]
-            next_idx = state["next_idx"]
-            saved_milestones = set(state.get("saved_milestones", []))
-            logger.info(
-                "Resuming experiment fitting from %d/%d (total_done=%d)",
-                next_idx,
-                len(shuffled_prompts),
-                total_done,
+        if state.get("max_prompts") != max_prompts:
+            raise ValueError(
+                f"checkpoint at {checkpoint_path} was fitted with max_prompts="
+                f"{state.get('max_prompts')!r}, not {max_prompts!r}; "
+                "pass resume=False to discard it"
+            )
+        expected_projectors = (
+            [projector.metadata.as_dict() for projector in projectors]
+            if projectors is not None
+            else []
+        )
+        if state.get("projectors", []) != expected_projectors:
+            raise ValueError(
+                f"checkpoint at {checkpoint_path} has different projector "
+                "configurations; use a new run name or pass resume=False"
+            )
+        if state.get("save_projected_features", True) != save_projected_features:
+            raise ValueError(
+                f"checkpoint at {checkpoint_path} has a different "
+                "save_projected_features setting; use a new run name or "
+                "pass resume=False"
+            )
+        if state.get("save_milestone_lenses", True) != save_milestone_lenses:
+            raise ValueError(
+                f"checkpoint at {checkpoint_path} has a different "
+                "save_milestone_lenses setting; use a new run name or "
+                "pass resume=False"
+            )
+        total_jacobian_sum = state["total_jacobian_sum"]
+        dataset_jacobian_sums = state["dataset_jacobian_sums"]
+        dataset_counts = state["dataset_counts"]
+        total_done = state["total_done"]
+        next_idx = state["next_idx"]
+        saved_milestones = set(state.get("saved_milestones", []))
+        fit_complete = state.get("fit_complete", False)
+        if projectors is not None and next_idx > 0:
+            if fit_complete:
+                projection_cache_available = False
+            elif save_projected_features:
+                assert projected_root
+                for projector in projectors:
+                    projector.prepare_feature_cache_for_resume(
+                        projected_root,
+                        next_prompt_index=next_idx,
+                        expected_count=total_done,
+                    )
+            else:
+                projection_cache_available = False
+            if not fit_complete and not save_projected_features:
+                projection_cache_available = False
+            if fit_complete and save_projected_features:
+                assert projected_root
+                for projector in projectors:
+                    projector.clear_disk_cache(projected_root)
+            if not fit_complete and not projection_cache_available and save_projected_features:
+                raise ValueError(
+                    "Could not restore projected feature caches for this fit. "
+                    "Use a new run name or pass resume=False to rebuild them."
+                )
+            for projector in projectors:
+                assert projected_root
+                projector_dir = projector.projected_directory(projected_root)
+                if not (projector_dir / "projection_matrix.npz").is_file():
+                    if fit_complete:
+                        raise FileNotFoundError(
+                            "Completed fit checkpoint is missing projected artifacts: "
+                            f"{projector_dir}"
+                        )
+        logger.info(
+            "Resuming experiment fitting from %d/%d (total_done=%d)",
+            next_idx,
+            len(shuffled_prompts),
+            total_done,
+        )
+
+    if projected_root and projectors is not None:
+        for projector in projectors:
+            projector.save_projection_matrix(
+                projected_root, source_layers=source_layers
             )
 
     def write_checkpoint() -> None:
         if checkpoint_path is not None:
-            _atomic_save(
-                {
-                    "total_jacobian_sum": total_jacobian_sum,
-                    "dataset_jacobian_sums": dataset_jacobian_sums,
-                    "dataset_counts": dataset_counts,
-                    "total_done": total_done,
-                    "next_idx": next_idx,
-                    "saved_milestones": list(saved_milestones),
-                    "source_layers": source_layers,
-                    "target_layer": target_layer,
-                    "skip_first": skip_first,
-                    "seed": seed,
-                    "max_prompts": max_prompts,
-                },
-                checkpoint_path,
-            )
-
-    sqrt_d = math.sqrt(d_model)
+            state = {
+                "total_jacobian_sum": total_jacobian_sum,
+                "dataset_jacobian_sums": dataset_jacobian_sums,
+                "dataset_counts": dataset_counts,
+                "total_done": total_done,
+                "next_idx": next_idx,
+                "saved_milestones": list(saved_milestones),
+                "source_layers": source_layers,
+                "target_layer": target_layer,
+                "skip_first": skip_first,
+                "seed": seed,
+                "max_prompts": max_prompts,
+                "projectors": (
+                    [projector.metadata.as_dict() for projector in projectors]
+                    if projectors is not None
+                    else []
+                ),
+                "save_projected_features": save_projected_features,
+                "save_milestone_lenses": save_milestone_lenses,
+                "fit_complete": fit_complete,
+            }
+            _atomic_save(state, checkpoint_path)
 
     for prompt_idx, prompt in enumerate(shuffled_prompts):
         if prompt_idx < next_idx:
@@ -488,7 +651,7 @@ def subset_fit_experiment(
                 target_layer=target_layer,
                 dim_batch=dim_batch,
                 skip_first=skip_first,
-                effective_max_seq_len=effective_max_seq_len,
+                effective_max_seq_len=max_seq_len,
                 processor=processor,
                 data_root=data_root,
             )
@@ -514,7 +677,23 @@ def subset_fit_experiment(
             dataset_jacobian_sums[dataset_name][l] += per_prompt_J[l]
         dataset_counts[dataset_name] += 1
 
-        prompt_norm = max(per_prompt_J[l].norm().item() for l in source_layers) / sqrt_d
+        if projectors is not None and save_projected_features:
+            sample_id = parsed_sample.sample_id
+            prompt_id = (
+                str(sample_id) if sample_id is not None else f"prompt_{prompt_idx}"
+            )
+            for projector in projectors:
+                assert projected_root
+                projector.cache_prompt(
+                    per_prompt_J,
+                    source_layers,
+                    sample_id=prompt_id,
+                    dataset_name=dataset_name,
+                    prompt_index=prompt_idx,
+                    cache_dir=projector.feature_cache_directory(projected_root),
+                )
+
+        prompt_norm = max(per_prompt_J[l].norm().item() for l in source_layers) / math.sqrt(d_model)
         logger.info(
             "  [exp] prompt %d/%d (total_done=%d, ds=%s) seq_len=%d n_valid=%d %.0fs "
             "max||J||/sqrt(d)=%.3f",
@@ -528,7 +707,7 @@ def subset_fit_experiment(
             prompt_norm,
         )
 
-        # Check milestones
+        # Save milestones
         if total_done in sorted_milestones and total_done not in saved_milestones:
             m_means = {l: total_jacobian_sum[l] / total_done for l in source_layers}
             m_lens = JacobianLens(jacobians=m_means, n_prompts=total_done, d_model=d_model)
@@ -541,8 +720,6 @@ def subset_fit_experiment(
 
         if checkpoint_every is not None and next_idx % checkpoint_every == 0:
             write_checkpoint()
-
-    write_checkpoint()
 
     if total_done == 0:
         raise ValueError("no prompts were successfully processed for experiment fitting")
@@ -559,31 +736,68 @@ def subset_fit_experiment(
             ds_lens.save(save_file)
             logger.info("Saved dataset lens for %s (n=%d) to %s", ds_name, cnt, save_file)
 
+    if (
+        projectors is not None
+        and projected_root is not None
+        and save_projected_features
+        and projection_cache_available
+    ):
+        for projector in projectors:
+            projector_dir = projector.save_features(
+                projected_root,
+                source_layers=list(source_layers),
+                dataset_counts=dataset_counts,
+                use_disk_cache=True,
+            )
+            logger.info(
+                "Saved projected prompt features for %s to %s",
+                projector.name,
+                projector_dir,
+            )
+
     # Final combined lens
     combined_mean = {l: total_jacobian_sum[l] / total_done for l in source_layers}
     combined_lens = JacobianLens(
         jacobians=combined_mean, n_prompts=total_done, d_model=d_model
     )
-    if output_dir:
+
+    if projectors is not None and projected_root is not None:
+        for projector in projectors:
+            projector.save_lens(
+                combined_lens,
+                projector.projected_directory(projected_root) / "lens_full.pt",
+            )
+    else:
         combined_save_file = os.path.join(output_dir, "lens_full.pt")
         combined_lens.save(combined_save_file)
-        # Write metadata
-        import json
-        meta = {
-            "seed": seed,
-            "total_prompts_input": total_prompts_input,
-            "total_prompts_selected": len(shuffled_prompts),
-            "max_prompts": max_prompts,
-            "total_done": total_done,
-            "dataset_counts": dataset_counts,
-            "saved_milestones": sorted(saved_milestones),
-            "source_layers": list(source_layers),
-            "target_layer": target_layer,
-            "mode": mode,
-        }
-        with open(os.path.join(output_dir, "metadata.json"), "w", encoding="utf-8") as f:
-            json.dump(meta, f, indent=2)
+    # Write metadata
+    import json
+    meta = {
+        "seed": seed,
+        "total_prompts_input": total_prompts_input,
+        "total_prompts_selected": len(shuffled_prompts),
+        "max_prompts": max_prompts,
+        "total_done": total_done,
+        "dataset_counts": dataset_counts,
+        "saved_milestones": sorted(saved_milestones),
+        "save_dataset_lenses": save_dataset_lenses,
+        "save_milestone_lenses": save_milestone_lenses,
+        "source_layers": list(source_layers),
+        "target_layer": target_layer,
+        "mode": mode,
+    }
+    if projectors is not None:
+        meta["projectors"] = [
+            projector.metadata.as_dict() for projector in projectors
+        ]
+    with open(os.path.join(output_dir, "metadata.json"), "w", encoding="utf-8") as f:
+        json.dump(meta, f, indent=2)
 
+    fit_complete = True
+    write_checkpoint()
+    if projectors is not None and projected_root is not None and save_projected_features:
+        for projector in projectors:
+            projector.clear_disk_cache(projected_root)
     return combined_lens, dataset_lenses, milestone_lenses
 
 

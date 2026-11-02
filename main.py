@@ -1,4 +1,7 @@
 import argparse
+import os
+
+os.environ.setdefault("HF_HOME", "/work/c8763c8763/huggingface-cache")
 
 from Master import Master
 
@@ -8,6 +11,23 @@ DEFAULT_LENS_PATH = (
     "train_1_no_SAKURA/experiment/lens_full.pt"
 )
 DEFAULT_PROMPTS_PATH = "data/assembled/test_SAKURA_AnimalQA/prompts.jsonl"
+
+
+def parse_projector(value: str) -> list[int]:
+    """Parse a projector argument formatted as DIMENSION:SEED."""
+    try:
+        dimension_text, seed_text = value.split(":", 1)
+        dimension = int(dimension_text)
+        seed = int(seed_text)
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "projector must be formatted as DIMENSION:SEED, e.g. 128:42"
+        ) from exc
+    if dimension <= 0 or seed < 0:
+        raise argparse.ArgumentTypeError(
+            "projector dimension must be positive and seed must be non-negative"
+        )
+    return [dimension, seed]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -103,10 +123,45 @@ def build_parser() -> argparse.ArgumentParser:
     compare.add_argument("--lens-path1", required=True)
     compare.add_argument("--lens-path2", required=True)
 
-    commands.add_parser(
+    fit_experiment = commands.add_parser(
         "calc-jlens-experiment",
         help="Call Master.calc_Jlens_experiment to fit an experiment lens.",
         parents=[common],
+    )
+    fit_experiment.add_argument(
+        "--projector",
+        action="append",
+        type=parse_projector,
+        default=None,
+        metavar="DIM:SEED",
+        help=(
+            "Use this random projector for this run; repeat to select multiple "
+            "projectors when per-prompt features are disabled."
+        ),
+    )
+    fit_experiment.add_argument(
+        "--save-projected-features",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Save per-prompt projected features for t-SNE; --no-save-projected-features "
+            "keeps only projected aggregate lenses."
+        ),
+    )
+    fit_experiment.add_argument(
+        "--save-dataset-lenses",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help="Save per-dataset lenses; use --no-save-dataset-lenses to disable.",
+    )
+    fit_experiment.add_argument(
+        "--save-milestone-lenses",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Save full-size cumulative milestone lenses; use "
+            "--no-save-milestone-lenses to disable."
+        ),
     )
 
     commands.add_parser(
@@ -169,7 +224,12 @@ def main() -> None:
             lens_path2=args.lens_path2,
         )
     elif args.command == "calc-jlens-experiment":
-        master.calc_Jlens_experiment()
+        master.calc_Jlens_experiment(
+            projector_pairs=args.projector,
+            save_projected_features=args.save_projected_features,
+            save_dataset_lenses=args.save_dataset_lenses,
+            save_milestone_lenses=args.save_milestone_lenses,
+        )
     elif args.command == "test-inference":
         master.test_inference()
     elif args.command == "test-training":

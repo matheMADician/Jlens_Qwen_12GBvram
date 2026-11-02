@@ -6,6 +6,9 @@ Arguments:
 * ``--config``: Dataset configuration, if required by the dataset.
 * ``--split``: Dataset split to download (default: ``train``).
 * ``--target``: Maximum number of samples to save; omit to process the full split.
+* ``--stratify-column``: Randomly sample equal counts from each label in a
+  categorical column. Requires ``--target`` and scans the complete split.
+* ``--seed``: Seed for reproducible stratified sampling (default: ``42``).
 * ``--output``: Output directory for audio and ``prompts.jsonl``.
 * ``--audio-column``: Dataset column containing audio (default: ``audio``).
 * ``--transcription``: Dataset column for the top-level transcript field;
@@ -49,8 +52,12 @@ import argparse
 import io
 import json
 import logging
+import os
+import random
 from pathlib import Path
 from typing import Any
+
+os.environ.setdefault("HF_HOME", "/work/c8763c8763/huggingface-cache")
 
 import librosa
 import soundfile as sf
@@ -69,6 +76,14 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--config", default=None, help="Optional dataset config")
 	parser.add_argument("--split", default="train", help="Dataset split")
 	parser.add_argument("--target", type=int, default=None, help="Maximum samples")
+	parser.add_argument(
+		"--stratify-column",
+		default=None,
+		help="Categorical column for equal-count random sampling across labels",
+	)
+	parser.add_argument(
+		"--seed", type=int, default=42, help="Random seed for stratified sampling"
+	)
 	parser.add_argument("--output", type=Path, default=Path("data/jlens_dataset"))
 	parser.add_argument("--audio-column", default="audio")
 	parser.add_argument(
@@ -168,6 +183,76 @@ def resolve_prompt_column(
 	return requested
 
 
+def stratified_sample_indices(
+	labels: list[Any],
+	target: int,
+	seed: int,
+) -> list[int]:
+	"""Choose a reproducible, near-equal random sample across label values."""
+	if target <= 0:
+		raise ValueError("--target must be a positive integer for stratified sampling.")
+	if target > len(labels):
+		raise ValueError(
+			f"Requested {target} samples, but the split contains only "
+			f"{len(labels)} rows."
+		)
+
+	indices_by_label: dict[Any, list[int]] = {}
+	for index, label in enumerate(labels):
+		if label is None:
+			raise ValueError(
+				f"Cannot stratify: row {index} has a missing label value."
+			)
+		try:
+			indices_by_label.setdefault(label, []).append(index)
+		except TypeError as exc:
+			raise ValueError(
+				f"Cannot stratify: label at row {index} is not hashable."
+			) from exc
+
+	if target < len(indices_by_label):
+		raise ValueError(
+			f"Cannot represent all {len(indices_by_label)} labels with "
+			f"--target {target}."
+		)
+
+	rng = random.Random(seed)
+	label_values = list(indices_by_label)
+	rng.shuffle(label_values)
+	quotas = {label: 0 for label in label_values}
+	remaining = target
+	while remaining:
+		progress = False
+		for label in label_values:
+			if quotas[label] < len(indices_by_label[label]):
+				quotas[label] += 1
+				remaining -= 1
+				progress = True
+				if not remaining:
+					break
+		if not progress:
+			raise ValueError(
+				f"Cannot sample {target} rows across the available label values."
+			)
+
+	selected = [
+		index
+		for label in label_values
+		for index in rng.sample(indices_by_label[label], quotas[label])
+	]
+	rng.shuffle(selected)
+	return selected
+
+
+def transcript_value(dataset: Any, column: str | None, value: Any) -> Any:
+	"""Convert Hugging Face ClassLabel IDs to their human-readable names."""
+	if column is None or not isinstance(value, int) or isinstance(value, bool):
+		return value
+	feature = getattr(dataset, "features", {}).get(column)
+	int2str = getattr(feature, "int2str", None)
+	return int2str(value) if callable(int2str) else value
+
+
 def build_messages(
 	audio_path: str,
 	instruction: str | None,
@@ -190,19 +275,48 @@ def download_dataset(args: argparse.Namespace) -> int:
 	audio_dir = output_dir / "audio"
 	metadata_path = output_dir / "prompts.jsonl"
 
+	if args.stratify_column is not None and args.target is None:
+		raise ValueError("--stratify-column requires --target.")
+	if args.stratify_column is not None and args.target <= 0:
+		raise ValueError("--target must be a positive integer for stratified sampling.")
+
 	if metadata_path.exists() and not args.overwrite:
 		raise FileExistsError(
 			f"{metadata_path} already exists; use --overwrite to replace it"
 		)
 
 	output_dir.mkdir(parents=True, exist_ok=True)
+	streaming = not args.no_streaming and args.stratify_column is None
+	if args.stratify_column is not None:
+		LOGGER.info(
+			"Stratified sampling scans the full split to identify labels; "
+			"loading it without streaming."
+		)
 	dataset = load_dataset(
 		args.dataset,
 		args.config,
 		split=args.split,
-		streaming=not args.no_streaming,
+		streaming=streaming,
 	)
 	dataset = dataset.cast_column(args.audio_column, Audio(decode=False))
+	selected_indices = None
+	if args.stratify_column is not None:
+		if args.stratify_column not in dataset.column_names:
+			raise KeyError(
+				f"Stratification column {args.stratify_column!r} not found. "
+				f"Available columns: {list(dataset.column_names)}"
+			)
+		selected_indices = stratified_sample_indices(
+			dataset[args.stratify_column],
+			args.target,
+			args.seed,
+		)
+		LOGGER.info(
+			"Selected %d of %d rows with near-equal label counts from %s",
+			len(selected_indices),
+			len(dataset),
+			args.stratify_column,
+		)
 	transcription_column = resolve_transcription_column(
 		dataset, args.transcription, args.dataset
 	)
@@ -211,11 +325,24 @@ def download_dataset(args: argparse.Namespace) -> int:
 	)
 
 	records: list[dict[str, Any]] = []
-	progress_total = getattr(dataset, "num_rows", None)
-	for source_index, sample in enumerate(
-		tqdm(dataset, total=progress_total, desc="Processing dataset", unit="sample")
+	progress_total = (
+		len(selected_indices)
+		if selected_indices is not None
+		else getattr(dataset, "num_rows", None)
+	)
+	samples = (
+		zip(selected_indices, dataset.select(selected_indices))
+		if selected_indices is not None
+		else enumerate(dataset)
+	)
+	for source_index, sample in tqdm(
+		samples, total=progress_total, desc="Processing dataset", unit="sample"
 	):
-		if args.target is not None and len(records) >= args.target:
+		if (
+			selected_indices is None
+			and args.target is not None
+			and len(records) >= args.target
+		):
 			break
 
 		audio = sample[args.audio_column]
@@ -232,6 +359,7 @@ def download_dataset(args: argparse.Namespace) -> int:
 		raw_text = (
 			None if transcription_column is None else sample[transcription_column]
 		)
+		raw_text = transcript_value(dataset, transcription_column, raw_text)
 		text = "" if raw_text is None else " ".join(str(raw_text).split())
 		raw_prompt = None if prompt_column is None else sample[prompt_column]
 		prompt = (

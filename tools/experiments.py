@@ -70,6 +70,10 @@ class Experiments:
             lens_path2 (str | None, optional): If not specified, compare lens1 to itself.
             device: Device for CKA calculation. Defaults to CUDA when available.
         """
+        if lens_path2 is not None:
+            from audio_jlens.random_proj import validate_projection_compatibility
+
+            validate_projection_compatibility(lens_path1, lens_path2)
         os.makedirs(heatmap_path, exist_ok=True)
         
         lens1 = Jlens(logger)
@@ -112,6 +116,10 @@ class Experiments:
         device: str | torch.device | None = None,
     ) -> torch.Tensor:
         """Draw pairwise cosine similarities between Jacobian matrices."""
+        if lens_path2 is not None:
+            from audio_jlens.random_proj import validate_projection_compatibility
+
+            validate_projection_compatibility(lens_path1, lens_path2)
         os.makedirs(heatmap_path, exist_ok=True)
         compute_device = torch.device(
             device
@@ -444,7 +452,9 @@ class Experiments:
                     f"Both lens outputs are required for sample {sample.sample_id}"
                 )
             available_layers = sorted(jlens_data[0])
-            logit_layers = sorted(logit_lens_data[0])
+            # Logitlens will include the second to last layer, while Jlens will not.
+            logit_layers = sorted(logit_lens_data[0])[:-1]
+            
             if available_layers != logit_layers:
                 raise ValueError(
                     "JLens and LogitLens layer outputs do not match: "

@@ -61,3 +61,22 @@ ID are retained in `source_dataset` and `source_id`.
 
 `assemble_json.sh` demonstrates sampling SAKURA's pre-prompted AnimalQA data
 for testing; SAKURA is not included in training data by default.
+
+## Downloading CREMA-D
+
+Run `bash data/get_cremad.sh` from the repository root to sample 1,000 clips
+from the `mteb/crema-d` `train` split into `data/datasets/crema_d`. Sampling is
+random within each emotion class and approximately balanced across the six
+labels (166 or 167 clips per class); the seed is fixed at 42. The label is
+written as a human-readable emotion name to each record's top-level
+`transcript` field.
+
+The script uses `--stratify-column` in `get_data.py`. Stratified sampling needs
+to inspect all labels, so it loads the full split locally before saving only
+the selected audio files. Use `--stratify-column` with `--target` for other
+categorical datasets; `--seed` controls the reproducible random selection.
+
+The data download scripts and `main.py` default Hugging Face's cache location
+to `/work/c8763c8763/huggingface-cache` when `HF_HOME` is not already set.
+An explicitly exported `HF_HOME` takes precedence. Existing cache directories
+are not moved or deleted.

@@ -40,11 +40,7 @@ data root. Existing output is appended unless ``--override`` is specified.
 
 from __future__ import annotations
 
-import argparse
-import copy
-import json
-import random
-import re
+import argparse, copy, json, random, re
 from collections import Counter
 from pathlib import Path
 from typing import Any

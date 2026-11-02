@@ -224,7 +224,14 @@ class Master:
             mode= mode
         )
 
-    def calc_Jlens_experiment(self):
+    def calc_Jlens_experiment(
+        self,
+        *,
+        projector_pairs: list[list[int]] | None = None,
+        save_projected_features: bool | None = None,
+        save_dataset_lenses: bool | None = None,
+        save_milestone_lenses: bool | None = None,
+    ):
         """Fit dataset-specific and cumulative-count JLens for an experiment.
 
         ``fitting.experiment`` settings:
@@ -234,11 +241,21 @@ class Master:
           - ``max_prompts``: optional cap applied after deterministic shuffling
           - ``dim_batch``: Jacobian output batch size
           - ``checkpoint_interval``: fit-state save interval
+          - ``random_projection``: opt-in projection and per-prompt t-SNE outputs
+          - ``projection_dim_seed``: projector settings as ``[dimension, seed]`` pairs
+          - ``save_projected_features``: durable per-prompt features for t-SNE
+          - ``save_dataset_lenses``: persist one lens per dataset (default: true)
+          - ``save_milestone_lenses``: persist cumulative milestone lenses (default: true)
         """
         fitting_settings = self.settings["fitting"]
         experiment_settings = fitting_settings.get("experiment", {})
         if not isinstance(experiment_settings, dict):
             raise ValueError("settings.json 'fitting.experiment' must be an object")
+        if projector_pairs is not None and not self.run_name:
+            raise ValueError(
+                "Pass --run-name when selecting a projector from the command line "
+                "so its fit checkpoint and artifacts have a stable location."
+            )
 
         seed = experiment_settings["seed"]
         if not isinstance(seed, int):
@@ -267,6 +284,91 @@ class Master:
                 "a positive integer or null"
             )
 
+        random_projection = experiment_settings.get("random_projection", False)
+        if projector_pairs is not None:
+            random_projection = True
+        if not isinstance(random_projection, bool):
+            raise ValueError(
+                "settings.json 'fitting.experiment.random_projection' must be a boolean"
+            )
+        projection_dim_seed = (
+            projector_pairs
+            if projector_pairs is not None
+            else experiment_settings.get("projection_dim_seed", [[128, 42]])
+        )
+        if save_projected_features is None:
+            save_projected_features = experiment_settings.get(
+                "save_projected_features", True
+            )
+        if not isinstance(save_projected_features, bool):
+            raise ValueError(
+                "settings.json 'fitting.experiment.save_projected_features' "
+                "must be a boolean"
+            )
+        if save_dataset_lenses is None:
+            save_dataset_lenses = experiment_settings.get("save_dataset_lenses", True)
+        if not isinstance(save_dataset_lenses, bool):
+            raise ValueError(
+                "settings.json 'fitting.experiment.save_dataset_lenses' "
+                "must be a boolean"
+            )
+        if save_milestone_lenses is None:
+            save_milestone_lenses = experiment_settings.get(
+                "save_milestone_lenses", True
+            )
+        if not isinstance(save_milestone_lenses, bool):
+            raise ValueError(
+                "settings.json 'fitting.experiment.save_milestone_lenses' "
+                "must be a boolean"
+            )
+        tsne_perplexity = experiment_settings.get("tsne_perplexity", 30.0)
+        if random_projection:
+            if not isinstance(projection_dim_seed, list) or not projection_dim_seed:
+                raise ValueError(
+                    "settings.json 'fitting.experiment.projection_dim_seed' must "
+                    "be a non-empty list of [projection_dim, seed] pairs"
+                )
+            for pair in projection_dim_seed:
+                if (
+                    not isinstance(pair, (list, tuple))
+                    or len(pair) != 2
+                    or not isinstance(pair[0], int)
+                    or isinstance(pair[0], bool)
+                    or pair[0] <= 0
+                    or not isinstance(pair[1], int)
+                    or isinstance(pair[1], bool)
+                    or pair[1] < 0
+                ):
+                    raise ValueError(
+                        "Each 'fitting.experiment.projection_dim_seed' entry "
+                        "must be [positive_dimension, non_negative_seed]"
+                    )
+            if len({tuple(pair) for pair in projection_dim_seed}) != len(
+                projection_dim_seed
+            ):
+                raise ValueError(
+                    "settings.json 'fitting.experiment.projection_dim_seed' "
+                    "must not contain duplicate dimension/seed pairs"
+                )
+            if save_projected_features and len(projection_dim_seed) != 1:
+                raise ValueError(
+                    "Per-prompt feature saving is limited to one projector per "
+                    "fit to bound disk usage. Run each projector with its own "
+                    "--projector DIM:SEED flag."
+                )
+            import math
+
+            if save_projected_features and (
+                not isinstance(tsne_perplexity, (int, float))
+                or isinstance(tsne_perplexity, bool)
+                or not math.isfinite(tsne_perplexity)
+                or tsne_perplexity <= 0
+            ):
+                raise ValueError(
+                    "settings.json 'fitting.experiment.tsne_perplexity' must be "
+                    "a positive finite number"
+                )
+
         checkpoint_name = self.run_name or "default"
         experiment_directory = os.path.join(
             self._model_output_root(fitting_settings["checkpoint_root"]),
@@ -292,7 +394,7 @@ class Master:
             milestone_counts,
             experiment_directory,
         )
-        return self.model.fit_Jlens_for_experiment(
+        fit_result = self.model.fit_Jlens_for_experiment(
             jsonl_path=os.path.abspath(fitting_settings["jsonl_path"]),
             data_root=self._configured_data_root(),
             seed=seed,
@@ -305,7 +407,58 @@ class Master:
             is_test=experiment_settings.get("is_test", False),
             checkpoint_interval=fitting_settings.get("checkpoint_interval", 5),
             max_prompts=max_prompts,
+            random_projection=random_projection,
+            projection_dim_seed=projection_dim_seed if random_projection else None,
+            save_projected_features=save_projected_features,
+            save_dataset_lenses=save_dataset_lenses,
+            save_milestone_lenses=save_milestone_lenses,
         )
+        if random_projection and save_projected_features:
+            from tools.projection_tsne import create_projection_tsne
+            from audio_jlens.random_proj import delete_saved_prompt_features
+
+            for projection_dim, projection_seed in projection_dim_seed:
+                projected_dir = os.path.join(
+                    experiment_directory,
+                    "projected",
+                    f"dim_{projection_dim}_seed_{projection_seed}",
+                )
+                plot_path = os.path.join(projected_dir, "tsne.png")
+                embedding_path = os.path.join(projected_dir, "tsne_embedding.npz")
+                feature_files = [
+                    name
+                    for name in os.listdir(projected_dir)
+                    if name.startswith("dataset_") and name.endswith(".npz")
+                ]
+                if os.path.isfile(plot_path) and os.path.isfile(embedding_path):
+                    delete_saved_prompt_features(projected_dir)
+                    self.logger.info(
+                        "t-SNE already exists for dim=%d seed=%d; skipping",
+                        projection_dim,
+                        projection_seed,
+                    )
+                    continue
+                if not feature_files:
+                    raise FileNotFoundError(
+                        "Per-prompt projected features are unavailable for t-SNE "
+                        f"in {projected_dir}. They may have been cleaned after a "
+                        "previous successful visualization."
+                    )
+                plot_path, embedding_path = create_projection_tsne(
+                    projected_dir,
+                    perplexity=float(tsne_perplexity),
+                    random_state=projection_seed,
+                )
+                delete_saved_prompt_features(projected_dir)
+                self.logger.info(
+                    "Saved t-SNE for dim=%d seed=%d to %s and %s; removed raw "
+                    "per-prompt feature files",
+                    projection_dim,
+                    projection_seed,
+                    plot_path,
+                    embedding_path,
+                )
+        return fit_result
     
     # Experiment methods
     # ---------------------------------------------------------------------------------------
@@ -416,6 +569,9 @@ class Master:
     
     def comp_Jlens(self, lens_path1: str, lens_path2: str) -> str:
         """Compare matching Jacobian layers and save metrics in the two-lens run folder."""
+        from audio_jlens.random_proj import validate_projection_compatibility
+
+        validate_projection_compatibility(lens_path1, lens_path2)
         lens1 = Jlens(logger=self.logger)
         lens2 = Jlens(logger=self.logger)
         lens1.load_lens(path=lens_path1)
