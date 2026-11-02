@@ -39,6 +39,20 @@
         "pass_k_AUC": {
             "k_values": [1, 2, 4, 8, 16, 32, 64, 128, 256],
             "output_root": "output/pass_k_AUC"
+        },
+        "swap": {
+            "instruction": "What animal is making this sound? Answer in one word.",
+            "candidate_words": ["dog", "cat", "cow", "bird", "wolf", "bear", "hen", "crow", "monkey", "snake", "mouse", "fish", "fox"],
+            "candidates_per_prompt": 3,
+            "layer_bands_percent": [[0, 25], [25, 50], [50, 75], [75, 100], [38, 92]],
+            "direction_sources": ["jlens", "logit", "random"],
+            "position_policies": ["all"],
+            "alpha": 1.0,
+            "clamp_to_clean": true,
+            "max_direction_cosine": 0.9,
+            "max_prompts": 20,
+            "seed": 42,
+            "output_root": "output/swap"
         }
     }
 }

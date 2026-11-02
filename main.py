@@ -30,6 +30,17 @@ def parse_projector(value: str) -> list[int]:
     return [dimension, seed]
 
 
+def parse_layer_band(value: str) -> list[float]:
+    """Parse a layer band argument formatted as START:END depth percentages."""
+    try:
+        start_text, end_text = value.split(":", 1)
+        return [float(start_text), float(end_text)]
+    except ValueError as exc:
+        raise argparse.ArgumentTypeError(
+            "layer band must be formatted as START:END, e.g. 38:92"
+        ) from exc
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Run a Master workflow.")
     common = argparse.ArgumentParser(add_help=False)
@@ -87,6 +98,35 @@ def build_parser() -> argparse.ArgumentParser:
         type=int,
         default=None,
         help="Number of top predictions to write to the inference CSV.",
+    )
+
+    swap = commands.add_parser(
+        "eval-swap",
+        help="Call Master.eval_swap to run the concept swap experiment.",
+        parents=[common],
+    )
+    swap.add_argument(
+        "--lens-path",
+        required=True,
+        help="Full-size JLens fitted on the configured model; projected lenses are rejected.",
+    )
+    swap.add_argument("--prompts-path", default=DEFAULT_PROMPTS_PATH)
+    swap.add_argument(
+        "--max-prompts",
+        type=int,
+        default=None,
+        help="Number of prompts to run; defaults to experiment.swap.max_prompts.",
+    )
+    swap.add_argument(
+        "--layer-band",
+        action="append",
+        type=parse_layer_band,
+        default=None,
+        metavar="START:END",
+        help=(
+            "Depth percentage band to swap at, e.g. 38:92; repeat for multiple "
+            "bands. Defaults to experiment.swap.layer_bands_percent."
+        ),
     )
 
     generate = commands.add_parser(
@@ -206,6 +246,13 @@ def main() -> None:
             prompts_path=args.prompts_path,
             top_k=args.top_k,
             layer=args.layer,
+        )
+    elif args.command == "eval-swap":
+        master.eval_swap(
+            lens_path=args.lens_path,
+            prompts_path=args.prompts_path,
+            max_prompts=args.max_prompts,
+            layer_bands_percent=args.layer_band,
         )
     elif args.command == "generate":
         master.generate(

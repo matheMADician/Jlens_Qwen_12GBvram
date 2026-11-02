@@ -6,6 +6,7 @@ import torch
 from torch import nn, Tensor
 
 from jlens.protocol import LensModel
+from tools.matrix_tools import MatrixTools
 
 
 ABLATION_MODES = ("ablation", "jablation", "injection")
@@ -209,6 +210,98 @@ class Instance(LensModel):
 
             patched = hidden.clone()
             patched[:, positions, :] = updated.to(hidden.dtype)
+            return patched if torch.is_tensor(output) else (patched, *output[1:])
+
+        return hook
+
+    def capture_forward(
+        self,
+        input_ids: Tensor,
+        layers: list[int],
+    ) -> tuple[Tensor, dict[int, Tensor]]:
+        """Run forward and return the final residual and each given layer's output."""
+        captured: dict[int, Tensor] = {}
+        handles = []
+
+        def make_capture_hook(layer: int):
+            def hook(_module, _inputs, output):
+                hidden = output if torch.is_tensor(output) else output[0]
+                captured[layer] = hidden.detach()
+
+            return hook
+
+        try:
+            for layer in layers:
+                handles.append(
+                    self.layers[layer].register_forward_hook(make_capture_hook(layer))
+                )
+            with torch.no_grad():
+                return self.forward(input_ids), captured
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    def swap_forward(
+        self,
+        input_ids: Tensor,
+        directions: dict[int, tuple[Tensor, Tensor]],
+        token_pos: list[int],
+        *,
+        alpha: float = 1.0,
+        clean_residuals: dict[int, Tensor] | None = None,
+    ) -> Tensor:
+        """
+        * Runs forward while swapping two directions at the given layers and positions.
+        * directions maps each layer to its (source, target) pair.
+        * token_pos must be non-negative and unique.
+        * clean_residuals clamps each layer's coordinates to the swapped clean-pass values.
+          Without it, each layer swaps its current values, which partly undoes the
+          previous layer's swap because residual connections carry it forward.
+        * Returns the final-layer residual.
+        """
+        handles = []
+        try:
+            for layer, (source, target) in directions.items():
+                handles.append(
+                    self.layers[layer].register_forward_hook(
+                        self._make_swap_hook(
+                            source,
+                            target,
+                            token_pos,
+                            alpha,
+                            None if clean_residuals is None else clean_residuals[layer],
+                        )
+                    )
+                )
+            with torch.no_grad():
+                return self.forward(input_ids)
+        finally:
+            for handle in handles:
+                handle.remove()
+
+    @staticmethod
+    def _make_swap_hook(
+        source: Tensor,
+        target: Tensor,
+        token_pos: list[int],
+        alpha: float,
+        clean_residual: Tensor | None = None,
+    ):
+        def hook(_module, _inputs, output):
+            hidden = output if torch.is_tensor(output) else output[0]
+            # The pseudoinverse does not support half precision.
+            updated = MatrixTools.swap_residual(
+                hidden[:, token_pos, :].float(),
+                source,
+                target,
+                alpha=alpha,
+                reference=(
+                    None if clean_residual is None
+                    else clean_residual[:, token_pos, :].float()
+                ),
+            )
+            patched = hidden.clone()
+            patched[:, token_pos, :] = updated.to(hidden.dtype)
             return patched if torch.is_tensor(output) else (patched, *output[1:])
 
         return hook

@@ -42,6 +42,63 @@ class MatrixTools:
         )
 
     @staticmethod
+    def swap_residual(
+        residual: Tensor,
+        source_direction: Tensor,
+        target_direction: Tensor,
+        *,
+        alpha: float = 1.0,
+        reference: Tensor | None = None,
+    ) -> Tensor:
+        """Swap the coordinates of two lens directions in a residual.
+
+        With ``V = [source, target]``, computes ``c = pinv(V) h`` and returns
+        ``h + V (alpha * swap(c_ref) - c)``. Components orthogonal to both
+        directions are unchanged.
+
+        Args:
+            residual: Tensor of shape ``[..., d_model]``. Must be float32 or
+                float64 because the pseudoinverse does not support half precision.
+            source_direction: Direction of shape ``[d_model]``.
+            target_direction: Direction of shape ``[d_model]``.
+            alpha: Scale applied to the swapped coordinates.
+            reference: Residual whose coordinates get swapped, with the same
+                shape as ``residual``. Defaults to ``residual`` itself. Passing
+                the clean-pass residual clamps the coordinates, so swapping at
+                consecutive layers does not undo the previous layer's swap.
+
+        Returns:
+            The patched residual, with the same shape as ``residual``.
+        """
+        if source_direction.ndim != 1 or source_direction.shape != target_direction.shape:
+            raise ValueError(
+                "Directions must be matching 1-D tensors, got "
+                f"{tuple(source_direction.shape)} and {tuple(target_direction.shape)}."
+            )
+        if residual.ndim == 0 or residual.shape[-1] != source_direction.shape[0]:
+            raise ValueError(
+                f"Residual shape {tuple(residual.shape)} does not end in "
+                f"d_model={source_direction.shape[0]}."
+            )
+        if reference is not None and reference.shape != residual.shape:
+            raise ValueError(
+                f"Reference shape {tuple(reference.shape)} does not match "
+                f"residual shape {tuple(residual.shape)}."
+            )
+        directions = torch.stack(
+            [source_direction, target_direction], dim=1
+        ).to(device=residual.device, dtype=residual.dtype)
+        inverse = torch.linalg.pinv(directions).T
+        coordinates = residual @ inverse
+        reference_coordinates = (
+            coordinates
+            if reference is None
+            else reference.to(device=residual.device, dtype=residual.dtype) @ inverse
+        )
+        swapped = alpha * reference_coordinates.flip(-1)
+        return residual + (swapped - coordinates) @ directions.T
+
+    @staticmethod
     def _validate_jacobian(
         jacobian: Tensor,
         *,

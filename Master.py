@@ -927,6 +927,60 @@ class Master:
         self.logger.info("Saved pass@k AUC-by-layer plot to %s", layer_auc_plot_path)
         return output_root
     
+    def eval_swap(
+        self,
+        lens_path: str,
+        prompts_path: str,
+        max_prompts: int | None = None,
+        layer_bands_percent: list[list[float]] | None = None,
+    ) -> str:
+        """Run the swap experiment and save its JSON report and per-swap CSV."""
+        swap_settings = self.settings["experiment"]["swap"]
+        task_name = self.run_name or "default"
+        output_root = os.path.join(
+            self._model_output_root(swap_settings["output_root"]),
+            task_name,
+        )
+        evaluation = Experiments.swap_verbal_report(
+            logger=self.logger,
+            model=self.model,
+            run_name=task_name,
+            lens_path=lens_path,
+            prompts_path=prompts_path,
+            data_root=self._configured_data_root(),
+            instruction=swap_settings["instruction"],
+            candidate_words=swap_settings["candidate_words"],
+            layer_bands_percent=layer_bands_percent or swap_settings["layer_bands_percent"],
+            candidates_per_prompt=swap_settings["candidates_per_prompt"],
+            direction_sources=swap_settings["direction_sources"],
+            position_policies=swap_settings["position_policies"],
+            alpha=swap_settings["alpha"],
+            max_direction_cosine=swap_settings["max_direction_cosine"],
+            max_prompts=max_prompts if max_prompts is not None else swap_settings["max_prompts"],
+            seed=swap_settings["seed"],
+            clamp_to_clean=swap_settings["clamp_to_clean"],
+        )
+        rows = evaluation.pop("rows")
+
+        os.makedirs(output_root, exist_ok=True)
+        report_path = os.path.join(output_root, f"{task_name}_swap_report.json")
+        with open(report_path, "w", encoding="utf-8") as report_file:
+            json.dump(
+                {"lens_path": lens_path, "prompts_path": prompts_path, **evaluation},
+                report_file,
+                indent=2,
+                ensure_ascii=False,
+            )
+        csv_path = os.path.join(output_root, f"{task_name}_swap_rows.csv")
+        with open(csv_path, "w", newline="", encoding="utf-8-sig") as output_file:
+            if rows:
+                writer = csv.DictWriter(output_file, fieldnames=list(rows[0]))
+                writer.writeheader()
+                writer.writerows(rows)
+        self.logger.info("Saved swap report to %s", report_path)
+        self.logger.info("Saved %d swaps to %s", len(rows), csv_path)
+        return output_root
+
     # Inference methods
     # ---------------------------------------------------------------------------------------
     def apply_Jlens(

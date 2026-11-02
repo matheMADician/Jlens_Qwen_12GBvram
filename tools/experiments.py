@@ -1,4 +1,4 @@
-import os, math
+import os, math, json, random, statistics
 from dataclasses import dataclass
 
 import torch
@@ -8,7 +8,9 @@ from audio_jlens.jlens import Jlens
 from json_parser import Parser
 from tools.math_tools import MathTools
 from tools.matrix_tools import MatrixTools, LayerSVDMetrics
-from model.model import Model
+from model.model import Model, SWAP_DIRECTION_SOURCES
+
+SWAP_POSITION_POLICIES = ("all", "audio", "after_audio", "last")
 
 @dataclass
 class passk_cache:
@@ -50,7 +52,329 @@ class Experiments:
     @staticmethod
     def comp_dataset_choice():
         pass
-    
+
+    @staticmethod
+    def swap_token_positions(input_ids: Tensor, tokenizer, policy: str) -> list[int]:
+        """Return the positions selected by a policy in SWAP_POSITION_POLICIES.
+
+        "audio" covers <|audio_bos|> through <|audio_eos|>, and "after_audio"
+        covers everything after <|audio_eos|>.
+        """
+        if policy not in SWAP_POSITION_POLICIES:
+            raise ValueError(
+                f"Unknown position policy {policy!r}; "
+                f"expected one of {SWAP_POSITION_POLICIES}"
+            )
+        ids = input_ids.reshape(-1).tolist()
+        if policy == "all":
+            return list(range(len(ids)))
+        if policy == "last":
+            return [len(ids) - 1]
+
+        audio_bos = tokenizer.convert_tokens_to_ids("<|audio_bos|>")
+        audio_eos = tokenizer.convert_tokens_to_ids("<|audio_eos|>")
+        if ids.count(audio_bos) != 1 or ids.count(audio_eos) != 1:
+            raise ValueError(
+                "Expected exactly one audio segment, found "
+                f"{ids.count(audio_bos)} <|audio_bos|> and "
+                f"{ids.count(audio_eos)} <|audio_eos|> tokens."
+            )
+        audio_start = ids.index(audio_bos)
+        audio_end = ids.index(audio_eos)
+        if audio_end < audio_start:
+            raise ValueError("<|audio_eos|> appears before <|audio_bos|>.")
+        if policy == "audio":
+            return list(range(audio_start, audio_end + 1))
+        positions = list(range(audio_end + 1, len(ids)))
+        if not positions:
+            raise ValueError("No tokens follow the audio segment.")
+        return positions
+
+    @staticmethod
+    def swap_layer_bands(
+        percent_bands: list[list[float]],
+        n_layers: int,
+        source_layers: list[int],
+    ) -> dict[str, list[int]]:
+        """Convert [start, end] depth percentages into lens layers.
+
+        Depth runs from 0 at the first layer to 100 at the final layer, matching
+        the paper's reindexing. Both ends of a band are inclusive.
+        """
+        if n_layers < 2:
+            raise ValueError("At least two layers are required to define depth.")
+        bands: dict[str, list[int]] = {}
+        for band in percent_bands:
+            if len(band) != 2 or not 0 <= band[0] <= band[1] <= 100:
+                raise ValueError(
+                    f"Each band must be [start, end] within 0-100, got {band!r}."
+                )
+            start, end = band
+            layers = [
+                layer
+                for layer in sorted(source_layers)
+                if start <= layer * 100 / (n_layers - 1) <= end
+            ]
+            if not layers:
+                raise ValueError(f"Band {band!r} contains no lens layers.")
+            bands[f"L{start:g}-{end:g}"] = layers
+        return bands
+
+    @staticmethod
+    def swap_single_token(tokenizer, text: str) -> int | None:
+        """Return the token ID when text is exactly one token, otherwise None."""
+        token_ids = tokenizer(text, add_special_tokens=False)["input_ids"]
+        return token_ids[0] if len(token_ids) == 1 else None
+
+    @staticmethod
+    def swap_candidate_tokens(
+        tokenizer,
+        source_text: str,
+        words: list[str],
+        count: int,
+    ) -> dict[str, int]:
+        """Pick the first single-token words, written in the same form as the source.
+
+        A swap only compares like with like when the case and leading whitespace
+        of the replacement match the token the model actually chose.
+        """
+        core = source_text.strip()
+        prefix = source_text[: len(source_text) - len(source_text.lstrip())]
+        candidates: dict[str, int] = {}
+        for word in words:
+            if word.lower() == core.lower():
+                continue
+            form = word.capitalize() if core[:1].isupper() else word.lower()
+            token_id = Experiments.swap_single_token(tokenizer, prefix + form)
+            if token_id is not None:
+                candidates[word.lower()] = token_id
+            if len(candidates) == count:
+                break
+        return candidates
+
+    @staticmethod
+    def swap_prompt_line(json_line: str, instruction: str) -> str:
+        """Return the JSONL record with its user text replaced by instruction."""
+        record = json.loads(json_line)
+        record["messages"][0]["content"][1]["text"] = instruction
+        return json.dumps(record, ensure_ascii=False)
+
+    @staticmethod
+    def swap_verbal_report(
+        logger,
+        model: Model,
+        run_name: str,
+        lens_path: str,
+        prompts_path: str,
+        data_root: str,
+        instruction: str,
+        candidate_words: list[str],
+        layer_bands_percent: list[list[float]],
+        candidates_per_prompt: int = 3,
+        direction_sources: list[str] | None = None,
+        position_policies: list[str] | None = None,
+        alpha: float = 1.0,
+        max_direction_cosine: float = 0.9,
+        max_prompts: int | None = None,
+        seed: int = 42,
+        clamp_to_clean: bool = True,
+    ) -> dict[str, object]:
+        """Audio version of the paper's verbal-report swap experiment.
+
+        Asks for a one-word answer, treats the model's first token as the source
+        concept, and swaps it for other words of the same category. Each swap is
+        scored on the next token. Pairs whose directions are too similar stay in
+        ``rows`` but are excluded from ``summary``, because the pseudoinverse is
+        unstable for nearly parallel directions.
+        """
+        direction_sources = direction_sources or list(SWAP_DIRECTION_SOURCES)
+        position_policies = position_policies or ["all"]
+        for source in direction_sources:
+            if source not in SWAP_DIRECTION_SOURCES:
+                raise ValueError(f"Unknown direction source {source!r}.")
+        for policy in position_policies:
+            if policy not in SWAP_POSITION_POLICIES:
+                raise ValueError(f"Unknown position policy {policy!r}.")
+        if candidates_per_prompt < 1:
+            raise ValueError("candidates_per_prompt must be at least 1.")
+        if max_prompts is not None and max_prompts < 1:
+            raise ValueError("max_prompts must be at least 1 or None.")
+        vocabulary = {word.lower() for word in candidate_words}
+
+        json_lines = Parser.load_jsonl_lines(prompts_path)
+        random.Random(seed).shuffle(json_lines)
+        if max_prompts is not None:
+            json_lines = json_lines[:max_prompts]
+
+        # Swaps run on the same layers for every source so the controls stay comparable.
+        model.load_Jlens(lens_path=lens_path)
+        instance = model.load_model()
+        tokenizer = instance.tokenizer
+        bands = Experiments.swap_layer_bands(
+            layer_bands_percent, instance.n_layers, model.lens.lens.source_layers
+        )
+        instance.load_data(data_root=data_root)
+
+        rows: list[dict[str, object]] = []
+        skipped: list[dict[str, object]] = []
+        for prompt_index, raw_line in enumerate(json_lines):
+            json_line = Experiments.swap_prompt_line(raw_line, instruction)
+            sample = Parser.parse_json_line(json_line)
+            input_ids = instance.encode(json_line)
+            with torch.no_grad():
+                baseline_residual = instance.forward(input_ids)
+                answer_logits = instance.unembed(baseline_residual[0][[-1]])[0]
+            source_token = int(answer_logits.argmax().item())
+            source_text = tokenizer.decode([source_token])
+
+            if source_text.strip().lower() not in vocabulary:
+                skipped.append({
+                    "sample_id": sample.sample_id,
+                    "reason": "answer_not_in_candidates",
+                    "answer": source_text,
+                })
+                continue
+            candidates = Experiments.swap_candidate_tokens(
+                tokenizer, source_text, candidate_words, candidates_per_prompt
+            )
+            if not candidates:
+                skipped.append({
+                    "sample_id": sample.sample_id,
+                    "reason": "no_single_token_candidates",
+                    "answer": source_text,
+                })
+                continue
+
+            positions_by_policy = {
+                policy: Experiments.swap_token_positions(input_ids, tokenizer, policy)
+                for policy in position_policies
+            }
+            transcript = (sample.transcript or "").strip().lower()
+            for word, target_token in candidates.items():
+                for band_name, layers in bands.items():
+                    for direction_source in direction_sources:
+                        for policy, positions in positions_by_policy.items():
+                            result = model.run_swap_inference(
+                                jsonl_line=json_line,
+                                data_root=data_root,
+                                source_token=source_token,
+                                target_token=target_token,
+                                layers=layers,
+                                token_pos=positions,
+                                alpha=alpha,
+                                direction_source=direction_source,
+                                random_seed=seed + len(rows),
+                                clamp_to_clean=clamp_to_clean,
+                            )
+                            rows.append(
+                                Experiments._swap_row(
+                                    tokenizer,
+                                    result,
+                                    sample_id=sample.sample_id,
+                                    label_match=transcript == source_text.strip().lower(),
+                                    source_token=source_token,
+                                    target_token=target_token,
+                                    target_word=word,
+                                    band_name=band_name,
+                                    direction_source=direction_source,
+                                    position_policy=policy,
+                                    max_direction_cosine=max_direction_cosine,
+                                )
+                            )
+            logger.info(
+                "%s swap progress: %d/%d prompts, %d swaps",
+                run_name,
+                prompt_index + 1,
+                len(json_lines),
+                len(rows),
+            )
+
+        return {
+            "prompt_count": len(json_lines),
+            "clamp_to_clean": clamp_to_clean,
+            "alpha": alpha,
+            "skipped": skipped,
+            "bands": bands,
+            "summary": Experiments._summarize_swap_rows(rows),
+            "rows": rows,
+        }
+
+    @staticmethod
+    def _swap_row(
+        tokenizer,
+        result,
+        *,
+        sample_id: str,
+        label_match: bool,
+        source_token: int,
+        target_token: int,
+        target_word: str,
+        band_name: str,
+        direction_source: str,
+        position_policy: str,
+        max_direction_cosine: float,
+    ) -> dict[str, object]:
+        """Score one swap from its next-token logits."""
+        baseline = result.baseline_logits[0]
+        swapped = result.swapped_logits[0]
+
+        def rank(logits: Tensor, token: int) -> int:
+            return int((logits > logits[token]).sum().item()) + 1
+
+        baseline_gap = float((baseline[target_token] - baseline[source_token]).item())
+        swapped_gap = float((swapped[target_token] - swapped[source_token]).item())
+        direction_cosine = max(abs(v) for v in result.direction_cosines.values())
+        return {
+            "sample_id": sample_id,
+            "label_match": label_match,
+            "source_text": tokenizer.decode([source_token]),
+            "target_word": target_word,
+            "target_text": tokenizer.decode([target_token]),
+            "band": band_name,
+            "direction_source": direction_source,
+            "position_policy": position_policy,
+            "swapped_top_text": tokenizer.decode([int(swapped.argmax().item())]),
+            "target_rank": rank(swapped, target_token),
+            "source_rank": rank(swapped, source_token),
+            "logit_gap_shift": swapped_gap - baseline_gap,
+            "direction_cosine": direction_cosine,
+            "excluded_high_cosine": direction_cosine > max_direction_cosine,
+        }
+
+    @staticmethod
+    def _summarize_swap_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+        """Aggregate swaps by direction source, layer band, and position policy."""
+        groups: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+        for row in rows:
+            key = (row["direction_source"], row["band"], row["position_policy"])
+            groups.setdefault(key, []).append(row)
+
+        summary = []
+        for (direction_source, band, policy), group in sorted(groups.items()):
+            kept = [row for row in group if not row["excluded_high_cosine"]]
+            count = len(kept)
+            summary.append({
+                "direction_source": direction_source,
+                "band": band,
+                "position_policy": policy,
+                "swap_count": count,
+                "excluded_high_cosine": len(group) - count,
+                "target_top1_rate": (
+                    sum(row["target_rank"] == 1 for row in kept) / count if count else None
+                ),
+                "source_displaced_rate": (
+                    sum(row["source_rank"] > 1 for row in kept) / count if count else None
+                ),
+                "median_target_rank": (
+                    statistics.median(row["target_rank"] for row in kept) if count else None
+                ),
+                "mean_logit_gap_shift": (
+                    statistics.fmean(row["logit_gap_shift"] for row in kept) if count else None
+                ),
+            })
+        return summary
+
+
     @staticmethod
     def draw_Jlens_cka_heatmap(
         logger,

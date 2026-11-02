@@ -1,4 +1,5 @@
 import os, logging, json, csv
+from dataclasses import dataclass
 from pathlib import Path
 from tkinter.tix import MAX
 import torch
@@ -264,6 +265,17 @@ class LensOutputCache:
                 - The second list contains the highest rank of each token across token positions.
         """
         return [], []
+
+SWAP_DIRECTION_SOURCES = ("jlens", "logit", "random")
+
+
+@dataclass
+class SwapInferenceResult:
+    baseline_logits: Tensor # [len(read_positions), vocab] on the CPU.
+    swapped_logits: Tensor # [len(read_positions), vocab] on the CPU.
+    input_ids: Tensor # [1, sequence_length]
+    direction_cosines: dict[int, float] # Source/target cosine at each swapped layer.
+
 
 class Model:
     """
@@ -683,3 +695,148 @@ class Model:
         baseline = logits_at(instance.ablation_forward(input_ids))
         ablated = logits_at(instance.ablation_forward(input_ids, spec))
         return baseline, ablated
+
+    @staticmethod
+    def _resolve_positions(positions: list[int], seq_len: int, name: str) -> list[int]:
+        """Convert Python-style positions to non-negative ones, rejecting bad input."""
+        if not positions:
+            raise ValueError(f"{name} must not be empty.")
+        out_of_range = [p for p in positions if not -seq_len <= p < seq_len]
+        if out_of_range:
+            raise ValueError(
+                f"{name} {out_of_range} are out of range for a sequence of length {seq_len}."
+            )
+        return [p % seq_len for p in positions]
+
+    def _swap_directions(
+        self,
+        source_token: int,
+        target_token: int,
+        layers: list[int],
+        direction_source: str,
+        random_seed: int,
+    ) -> dict[int, tuple[torch.Tensor, torch.Tensor]]:
+        """
+        * Returns the unit (source, target) directions of each layer.
+        * "jlens" uses J_l^T u, and "logit" uses u itself (the J = I case).
+        * "random" ignores the tokens and draws independent directions per layer.
+        """
+        instance = self.load_model()
+        if direction_source == "jlens":
+            jacobian_lens = getattr(self.lens, "lens", None)
+            if jacobian_lens is not None and jacobian_lens.d_model != instance.d_model:
+                raise ValueError(
+                    f"Lens d_model={jacobian_lens.d_model} does not match model "
+                    f"d_model={instance.d_model}. Projected lenses cannot be used for swaps."
+                )
+            source = self._token_directions(source_token, layers)
+            target = self._token_directions(target_token, layers)
+            return {layer: (source[layer], target[layer]) for layer in layers}
+
+        if direction_source == "logit":
+            def unit_unembedding(token_id: int) -> torch.Tensor:
+                row = instance.get_unembedding_direction(token_id)
+                return row / row.norm().clamp_min(1e-8)
+
+            pair = (unit_unembedding(source_token), unit_unembedding(target_token))
+            return {layer: pair for layer in layers}
+
+        generator = torch.Generator().manual_seed(random_seed)
+        directions = {}
+        for layer in layers:
+            source_vector, target_vector = torch.randn(
+                2, instance.d_model, generator=generator
+            ).unbind()
+            directions[layer] = (
+                source_vector / source_vector.norm(),
+                target_vector / target_vector.norm(),
+            )
+        return directions
+
+    def run_swap_inference(
+        self,
+        jsonl_line: str,
+        data_root: str,
+        source_token: int,
+        target_token: int,
+        layers: list[int],
+        token_pos: list[int] | None = None,
+        read_positions: list[int] | None = None,
+        alpha: float = 1.0,
+        direction_source: str = "jlens",
+        random_seed: int = 0,
+        clamp_to_clean: bool = True,
+    ) -> SwapInferenceResult:
+        """
+        * Swaps the coordinates of source_token and target_token, then reads the next-token logits.
+        * layers: layers to swap at. Each layer's output is patched once.
+        * token_pos: positions to swap at. Defaults to every position.
+        * read_positions: positions to read logits from. Defaults to the last position.
+        * alpha: scale applied to the swapped coordinates.
+        * direction_source: "jlens", or "logit" / "random" as controls.
+        * clamp_to_clean: set each layer's coordinates to the swapped clean-pass values.
+          False swaps the current values at each layer, so consecutive layers partly cancel.
+        * Python indexing is allowed for positions; out-of-range positions raise an error.
+        """
+        if direction_source not in SWAP_DIRECTION_SOURCES:
+            raise ValueError(
+                f"Unknown direction_source {direction_source!r}; "
+                f"expected one of {SWAP_DIRECTION_SOURCES}"
+            )
+        if source_token == target_token:
+            raise ValueError("source_token and target_token must differ.")
+        if not layers:
+            raise ValueError("layers must not be empty.")
+        # A repeated layer would swap twice, which undoes the intervention.
+        if len(set(layers)) != len(layers):
+            raise ValueError(f"layers must be unique, got {layers}.")
+
+        instance = self.load_model()
+        out_of_range = [l for l in layers if not 0 <= l < instance.n_layers]
+        if out_of_range:
+            raise ValueError(
+                f"layers {out_of_range} are out of range for a "
+                f"{instance.n_layers}-layer model."
+            )
+        directions = self._swap_directions(
+            source_token, target_token, layers, direction_source, random_seed
+        )
+
+        instance.load_data(data_root=data_root)
+        input_ids = instance.encode(jsonl_line)
+        seq_len = input_ids.shape[1]
+        positions = (
+            list(range(seq_len))
+            if token_pos is None
+            else self._resolve_positions(token_pos, seq_len, "token_pos")
+        )
+        if len(set(positions)) != len(positions):
+            raise ValueError(f"token_pos must be unique, got {token_pos}.")
+        read = self._resolve_positions(
+            [-1] if read_positions is None else read_positions, seq_len, "read_positions"
+        )
+
+        def logits_at(residual: torch.Tensor) -> torch.Tensor:
+            return instance.unembed(residual[0][read]).float().cpu()
+
+        baseline_residual, clean_residuals = instance.capture_forward(input_ids, layers)
+        with torch.no_grad():
+            baseline = logits_at(baseline_residual)
+            swapped = logits_at(
+                instance.swap_forward(
+                    input_ids,
+                    directions,
+                    positions,
+                    alpha=alpha,
+                    clean_residuals=clean_residuals if clamp_to_clean else None,
+                )
+            )
+        return SwapInferenceResult(
+            baseline_logits=baseline,
+            swapped_logits=swapped,
+            input_ids=input_ids,
+            direction_cosines={
+                layer: float((source @ target).item())
+                for layer, (source, target) in directions.items()
+            },
+        )
