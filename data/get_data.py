@@ -6,13 +6,16 @@ Arguments:
 * ``--config``: Dataset configuration, if required by the dataset.
 * ``--split``: Dataset split to download (default: ``train``).
 * ``--target``: Maximum number of samples to save; omit to process the full split.
-* ``--stratify-column``: Randomly sample equal counts from each label in a
-  categorical column. Requires ``--target`` and scans the complete split.
+* ``--stratify-column``: Randomly sample equal counts from each value in one
+  categorical column. ``--stratify-columns`` balances joint combinations.
+  Both require ``--target`` and scan the complete split.
 * ``--seed``: Seed for reproducible stratified sampling (default: ``42``).
 * ``--output``: Output directory for audio and ``prompts.jsonl``.
 * ``--audio-column``: Dataset column containing audio (default: ``audio``).
 * ``--transcription``: Dataset column for the top-level transcript field;
   auto-detected from transcription-specific column names if omitted.
+* ``--label-columns``: One or more dataset columns whose values are written to
+  the top-level ``label`` mapping, keyed by column name.
 * ``--prompt-column``: Dataset column for user instructions; prompt is empty if omitted.
 * ``--min-duration`` / ``--max-duration``: Optional audio-duration filters in seconds.
 * ``--sample-rate``: Output audio sample rate in Hz (default: ``16000``).
@@ -38,12 +41,14 @@ Example ``prompts.jsonl`` record::
 				]
 			}
 		],
-		"transcript": "音訊中的逐字稿"
+		"transcript": "音訊中的逐字稿",
+		"label": {"emotion": "angry", "language": "zh"}
 	}
 
 Set ``--prompt-column`` to populate the text part of the user message. If it is
-omitted, the text part remains present with an empty string. Transcriptions are
-stored in the top-level ``transcript`` field, not as assistant messages.
+omitted, the text part remains present with an empty string. Transcriptions are stored in the top-level ``transcript`` field, not as
+assistant messages. Metadata columns selected with ``--label-columns`` are
+stored in the top-level ``label`` mapping, keyed by source column name.
 """
 
 from __future__ import annotations
@@ -79,7 +84,13 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument(
 		"--stratify-column",
 		default=None,
-		help="Categorical column for equal-count random sampling across labels",
+		help="Single categorical column for equal-count stratified sampling",
+	)
+	parser.add_argument(
+		"--stratify-columns",
+		nargs="+",
+		default=None,
+		help="Columns whose joint categorical values define equal-count strata",
 	)
 	parser.add_argument(
 		"--seed", type=int, default=42, help="Random seed for stratified sampling"
@@ -90,6 +101,12 @@ def parse_args() -> argparse.Namespace:
 		"--transcription",
 		default=None,
 		help="Transcript column; auto-detect when omitted",
+	)
+	parser.add_argument(
+		"--label-columns",
+		nargs="+",
+		default=None,
+		help="Dataset columns to store in the top-level label mapping",
 	)
 	parser.add_argument(
 		"--prompt-column",
@@ -183,12 +200,29 @@ def resolve_prompt_column(
 	return requested
 
 
+def resolve_label_columns(
+	dataset: Any,
+	requested: list[str] | None,
+	dataset_name: str,
+) -> list[str]:
+	columns = list(dataset.column_names)
+	if requested is None:
+		return []
+	missing = [column for column in requested if column not in columns]
+	if missing:
+		raise KeyError(
+			f"Label columns {missing!r} not found in {dataset_name}. "
+			f"Available columns: {columns}"
+		)
+	return requested
+
+
 def stratified_sample_indices(
 	labels: list[Any],
 	target: int,
 	seed: int,
 ) -> list[int]:
-	"""Choose a reproducible, near-equal random sample across label values."""
+	"""Choose an exact, reproducible equal-count sample across strata."""
 	if target <= 0:
 		raise ValueError("--target must be a positive integer for stratified sampling.")
 	if target > len(labels):
@@ -199,7 +233,9 @@ def stratified_sample_indices(
 
 	indices_by_label: dict[Any, list[int]] = {}
 	for index, label in enumerate(labels):
-		if label is None:
+		if label is None or (
+			isinstance(label, tuple) and any(value is None for value in label)
+		):
 			raise ValueError(
 				f"Cannot stratify: row {index} has a missing label value."
 			)
@@ -210,35 +246,31 @@ def stratified_sample_indices(
 				f"Cannot stratify: label at row {index} is not hashable."
 			) from exc
 
-	if target < len(indices_by_label):
+	if target % len(indices_by_label) != 0:
 		raise ValueError(
-			f"Cannot represent all {len(indices_by_label)} labels with "
-			f"--target {target}."
+			f"--target {target} must be divisible by the number of strata "
+			f"({len(indices_by_label)}) to sample them equally."
 		)
 
 	rng = random.Random(seed)
 	label_values = list(indices_by_label)
 	rng.shuffle(label_values)
-	quotas = {label: 0 for label in label_values}
-	remaining = target
-	while remaining:
-		progress = False
-		for label in label_values:
-			if quotas[label] < len(indices_by_label[label]):
-				quotas[label] += 1
-				remaining -= 1
-				progress = True
-				if not remaining:
-					break
-		if not progress:
-			raise ValueError(
-				f"Cannot sample {target} rows across the available label values."
-			)
+	per_stratum = target // len(indices_by_label)
+	underrepresented = [
+		label
+		for label in label_values
+		if len(indices_by_label[label]) < per_stratum
+	]
+	if underrepresented:
+		raise ValueError(
+			f"Cannot sample {per_stratum} rows from every stratum; at least one "
+			"stratum has too few rows."
+		)
 
 	selected = [
 		index
 		for label in label_values
-		for index in rng.sample(indices_by_label[label], quotas[label])
+		for index in rng.sample(indices_by_label[label], per_stratum)
 	]
 	rng.shuffle(selected)
 	return selected
@@ -251,6 +283,44 @@ def transcript_value(dataset: Any, column: str | None, value: Any) -> Any:
 	feature = getattr(dataset, "features", {}).get(column)
 	int2str = getattr(feature, "int2str", None)
 	return int2str(value) if callable(int2str) else value
+
+
+def label_values(
+	dataset: Any, columns: list[str], sample: Any
+) -> dict[str, str | list[str]]:
+	"""Convert selected metadata columns into a named label mapping."""
+	labels: dict[str, str | list[str]] = {}
+	for column in columns:
+		if column not in sample:
+			raise KeyError(
+				f"Label column {column!r} is missing from a dataset row."
+			)
+		feature = getattr(dataset, "features", {}).get(column)
+		multiple_values = isinstance(sample[column], (list, tuple))
+		values: list[str] = []
+
+		def append_values(value: Any, value_feature: Any) -> None:
+			if value is None:
+				raise ValueError(
+					f"Label column {column!r} contains a missing value."
+				)
+			if isinstance(value, (list, tuple)):
+				item_feature = getattr(value_feature, "feature", value_feature)
+				for item in value:
+					append_values(item, item_feature)
+				return
+			int2str = getattr(value_feature, "int2str", None)
+			if (
+				isinstance(value, int)
+				and not isinstance(value, bool)
+				and callable(int2str)
+			):
+				value = int2str(value)
+			values.append(str(value))
+
+		append_values(sample[column], feature)
+		labels[column] = values if multiple_values else values[0]
+	return labels
 
 
 def build_messages(
@@ -275,9 +345,20 @@ def download_dataset(args: argparse.Namespace) -> int:
 	audio_dir = output_dir / "audio"
 	metadata_path = output_dir / "prompts.jsonl"
 
-	if args.stratify_column is not None and args.target is None:
-		raise ValueError("--stratify-column requires --target.")
-	if args.stratify_column is not None and args.target <= 0:
+	if args.stratify_column is not None and args.stratify_columns is not None:
+		raise ValueError(
+			"Use either --stratify-column or --stratify-columns, not both."
+		)
+	stratify_columns = (
+		args.stratify_columns
+		if args.stratify_columns is not None
+		else [args.stratify_column]
+		if args.stratify_column is not None
+		else None
+	)
+	if stratify_columns is not None and args.target is None:
+		raise ValueError("--stratify-column(s) requires --target.")
+	if stratify_columns is not None and args.target <= 0:
 		raise ValueError("--target must be a positive integer for stratified sampling.")
 
 	if metadata_path.exists() and not args.overwrite:
@@ -286,8 +367,8 @@ def download_dataset(args: argparse.Namespace) -> int:
 		)
 
 	output_dir.mkdir(parents=True, exist_ok=True)
-	streaming = not args.no_streaming and args.stratify_column is None
-	if args.stratify_column is not None:
+	streaming = not args.no_streaming and stratify_columns is None
+	if stratify_columns is not None:
 		LOGGER.info(
 			"Stratified sampling scans the full split to identify labels; "
 			"loading it without streaming."
@@ -300,28 +381,37 @@ def download_dataset(args: argparse.Namespace) -> int:
 	)
 	dataset = dataset.cast_column(args.audio_column, Audio(decode=False))
 	selected_indices = None
-	if args.stratify_column is not None:
-		if args.stratify_column not in dataset.column_names:
+	if stratify_columns is not None:
+		missing_columns = [
+			column for column in stratify_columns if column not in dataset.column_names
+		]
+		if missing_columns:
 			raise KeyError(
-				f"Stratification column {args.stratify_column!r} not found. "
+				f"Stratification columns {missing_columns!r} not found. "
 				f"Available columns: {list(dataset.column_names)}"
 			)
+		strata = list(
+			zip(*(dataset[column] for column in stratify_columns), strict=True)
+		)
 		selected_indices = stratified_sample_indices(
-			dataset[args.stratify_column],
+			strata,
 			args.target,
 			args.seed,
 		)
 		LOGGER.info(
-			"Selected %d of %d rows with near-equal label counts from %s",
+			"Selected %d of %d rows with equal counts across strata from %s",
 			len(selected_indices),
 			len(dataset),
-			args.stratify_column,
+			", ".join(stratify_columns),
 		)
 	transcription_column = resolve_transcription_column(
 		dataset, args.transcription, args.dataset
 	)
 	prompt_column = resolve_prompt_column(
 		dataset, args.prompt_column, args.dataset
+	)
+	label_columns = resolve_label_columns(
+		dataset, args.label_columns, args.dataset
 	)
 
 	records: list[dict[str, Any]] = []
@@ -379,6 +469,7 @@ def download_dataset(args: argparse.Namespace) -> int:
 				),
 				# Retain these legacy fields until the model-side loader is migrated.
 				"transcript": text,
+				"label": label_values(dataset, label_columns, sample),
 			}
 		)
 

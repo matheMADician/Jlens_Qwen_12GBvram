@@ -39,6 +39,16 @@ def parse_layer_band(value: str) -> list[float]:
         raise argparse.ArgumentTypeError(
             "layer band must be formatted as START:END, e.g. 38:92"
         ) from exc
+        
+def parse_eval_target(value: str) -> str:
+    """Parse a pass@k target as transcript or a scalar label field."""
+    if value == "transcript":
+        return value
+    if value.startswith("label.") and value[len("label."):].strip():
+        return value
+    raise argparse.ArgumentTypeError(
+        "target must be 'transcript' or 'label.<field>', e.g. label.emotion"
+    )
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -80,13 +90,52 @@ def build_parser() -> argparse.ArgumentParser:
         help="Path for the separate settings file to create.",
     )
 
+    merge = commands.add_parser(
+        "merge-jlens",
+        help="Merge multiple JLens checkpoints.",
+    )
+    merge.add_argument(
+        "--lens-path",
+        action="append",
+        required=True,
+        dest="lens_paths",
+        help="Input lens checkpoint; pass this option once per checkpoint.",
+    )
+    merge.add_argument("--output-path", required=True)
+    merge.add_argument(
+        "--merge-method",
+        choices=("original", "equal"),
+        default="original",
+        help="Use upstream prompt-count weights or an equal average across checkpoints.",
+    )
+
     evaluate = commands.add_parser(
         "eval-jlens",
         help="Call Master.eval_Jlens to evaluate a trained JLens.",
         parents=[common],
     )
-    evaluate.add_argument("--lens-path", default=DEFAULT_LENS_PATH)
+    evaluate.add_argument(
+        "--lens-path",
+        action="append",
+        dest="lens_paths",
+        help="Lens checkpoint; repeat to merge checkpoints in memory.",
+    )
+    evaluate.add_argument(
+        "--merge-method",
+        choices=("original", "equal"),
+        default="original",
+        help="Merge multiple lenses using upstream prompt weights or an equal average.",
+    )
     evaluate.add_argument("--prompts-path", default=DEFAULT_PROMPTS_PATH)
+    evaluate.add_argument(
+        "--target",
+        type=parse_eval_target,
+        default="transcript",
+        help=(
+            "Pass@k reference: transcript (default) or a scalar label field, "
+            "such as label.emotion."
+        ),
+    )
     evaluate.add_argument(
         "--layer",
         type=int,
@@ -154,19 +203,57 @@ def build_parser() -> argparse.ArgumentParser:
     info.add_argument("--lens-path", required=True)
     info.add_argument("--device", default=None)
     info.add_argument("--svd-device", default="cpu")
+    info.add_argument(
+        "--no-svd",
+        action="store_true",
+        help="Skip Jacobian SVD analysis and its plots.",
+    )
+    info.add_argument(
+        "--use-j-vectors",
+        action="store_true",
+        help=(
+            "Load the configured model and compute cosine/CKA from all "
+            "norm-scaled token unembedding vectors multiplied by each Jacobian."
+        ),
+    )
+    info.add_argument(
+        "--no-norm-scaling",
+        action="store_true",
+        help="With --use-j-vectors, omit the final norm weight and use WJ.",
+    )
 
     compare = commands.add_parser(
         "comp-jlens",
         help="Call Master.comp_Jlens to compare two JLens checkpoints.",
         parents=[common],
     )
-    compare.add_argument("--lens-path1", required=True)
-    compare.add_argument("--lens-path2", required=True)
+    compare.add_argument("--lens-path1", action="append", required=True, dest="lens_paths1")
+    compare.add_argument("--lens-path2", action="append", required=True, dest="lens_paths2")
+    compare.add_argument(
+        "--merge-method",
+        choices=("original", "equal"),
+        default="original",
+        help="Merge each lens group using upstream prompt weights or an equal average.",
+    )
+    compare.add_argument("--use-j-vectors", action="store_true")
+    compare.add_argument(
+        "--no-norm-scaling",
+        action="store_true",
+        help="With --use-j-vectors, omit the final norm weight and compare WJ.",
+    )
 
     fit_experiment = commands.add_parser(
         "calc-jlens-experiment",
         help="Call Master.calc_Jlens_experiment to fit an experiment lens.",
         parents=[common],
+    )
+    fit_experiment.add_argument(
+        "--prompts-path",
+        default=None,
+        help=(
+            "Training JSONL manifest; defaults to fitting.jsonl_path "
+            "from the settings file."
+        ),
     )
     fit_experiment.add_argument(
         "--projector",
@@ -186,6 +273,15 @@ def build_parser() -> argparse.ArgumentParser:
         help=(
             "Save per-prompt projected features for t-SNE; --no-save-projected-features "
             "keeps only projected aggregate lenses."
+        ),
+    )
+    fit_experiment.add_argument(
+        "--save-projected-blocks",
+        action=argparse.BooleanOptionalAction,
+        default=None,
+        help=(
+            "Save per-prompt projected block matrices using "
+            "fitting.experiment.projection_block_starts."
         ),
     )
     fit_experiment.add_argument(
@@ -235,17 +331,34 @@ def main() -> None:
         )
         print(settings_path)
         return
+    if args.command == "merge-jlens":
+        print(
+            Master.merge_Jlens(
+                args.lens_paths,
+                args.output_path,
+                merge_method=args.merge_method,
+            )
+        )
+        return
 
     if args.command == "test-training" and not args.run_name:
         parser.error("test-training requires --run-name")
+    if args.command == "info-jlens" and args.no_norm_scaling and not args.use_j_vectors:
+        parser.error("--no-norm-scaling requires --use-j-vectors")
+    if args.command == "comp-jlens" and args.no_norm_scaling and not args.use_j_vectors:
+        parser.error("--no-norm-scaling requires --use-j-vectors")
+    if args.command == "eval-jlens" and not args.lens_paths:
+        args.lens_paths = [DEFAULT_LENS_PATH]
     master = Master(run_name=args.run_name, settings_path=args.settings_file)
 
     if args.command == "eval-jlens":
         master.eval_Jlens(
-            lens_path=args.lens_path,
+            lens_paths=args.lens_paths,
             prompts_path=args.prompts_path,
             top_k=args.top_k,
             layer=args.layer,
+            merge_method=args.merge_method,
+            target=args.target,
         )
     elif args.command == "eval-swap":
         master.eval_swap(
@@ -264,16 +377,24 @@ def main() -> None:
             lens_path=args.lens_path,
             device=args.device,
             svd_device=args.svd_device,
+            use_j_vectors=args.use_j_vectors,
+            compute_svd=not args.no_svd,
+            use_norm_scaling=not args.no_norm_scaling,
         )
     elif args.command == "comp-jlens":
         master.comp_Jlens(
-            lens_path1=args.lens_path1,
-            lens_path2=args.lens_path2,
+            lens_paths1=args.lens_paths1,
+            lens_paths2=args.lens_paths2,
+            use_j_vectors=args.use_j_vectors,
+            use_norm_scaling=not args.no_norm_scaling,
+            merge_method=args.merge_method,
         )
     elif args.command == "calc-jlens-experiment":
         master.calc_Jlens_experiment(
+            prompts_path=args.prompts_path,
             projector_pairs=args.projector,
             save_projected_features=args.save_projected_features,
+            save_projected_blocks=args.save_projected_blocks,
             save_dataset_lenses=args.save_dataset_lenses,
             save_milestone_lenses=args.save_milestone_lenses,
         )

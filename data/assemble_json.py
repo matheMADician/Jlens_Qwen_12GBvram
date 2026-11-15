@@ -14,7 +14,8 @@ Jsonl example:
             ]
         }
     ],
-    "transcript": "dog"
+    "transcript": "",
+    "label": {"focus_class": "Dog", "labels": ["Dog", "Animal"]}
 }
 
 Examples:
@@ -35,7 +36,9 @@ Examples:
 
 The source directory must contain ``prompts.jsonl`` and the audio referenced
 by its records. Audio is not copied; paths in the output are relative to the
-data root. Existing output is appended unless ``--override`` is specified.
+data root. Labels are preserved when records are sampled; legacy records
+without labels receive an empty ``label`` mapping. Existing output is appended
+unless ``--override`` is specified.
 """
 
 from __future__ import annotations
@@ -276,6 +279,61 @@ def infer_data_root(source_root: Path) -> Path:
 	)
 
 
+def stratified_sample_indices(
+	records: list[dict[str, Any]],
+	candidate_indices: list[int],
+	count: int,
+	label_columns: list[str],
+	rng: random.Random,
+) -> list[int]:
+	"""Select a near-equal number of records from each joint label stratum."""
+	if not label_columns:
+		raise ValueError("--stratify-labels must contain at least one label key")
+	strata: dict[str, list[int]] = {}
+	for index in candidate_indices:
+		label = records[index].get("label")
+		if not isinstance(label, dict):
+			raise ValueError(
+				f"Record {records[index].get('id', index)!r} has no label mapping."
+			)
+		missing = [column for column in label_columns if column not in label]
+		if missing:
+			raise ValueError(
+				f"Record {records[index].get('id', index)!r} is missing label "
+				f"fields: {missing}"
+			)
+		key = json.dumps(
+			[label[column] for column in label_columns],
+			ensure_ascii=False,
+			sort_keys=True,
+		)
+		strata.setdefault(key, []).append(index)
+
+	if not strata:
+		raise ValueError("No candidate records available for stratified sampling.")
+	if count > len(candidate_indices):
+		raise ValueError(
+			f"Requested {count} records, but only {len(candidate_indices)} "
+			"candidates are available."
+		)
+
+	base_count, remainder = divmod(count, len(strata))
+	stratum_keys = sorted(strata)
+	extra_keys = set(rng.sample(stratum_keys, remainder)) if remainder else set()
+	selected: list[int] = []
+	for key in stratum_keys:
+		bucket = strata[key]
+		required = base_count + (key in extra_keys)
+		if len(bucket) < required:
+			raise ValueError(
+				f"Label combination {key} has {len(bucket)} candidates; "
+				f"at least {required} are required for balanced sampling."
+			)
+		selected.extend(rng.sample(bucket, required))
+	rng.shuffle(selected)
+	return selected
+
+
 def sample_dataset_records(
 	dataset_dir: Path,
 	dataset_name: str,
@@ -284,6 +342,7 @@ def sample_dataset_records(
 	seed: int,
 	existing_records: list[dict[str, Any]],
 	data_root: Path | None = None,
+	stratify_labels: list[str] | None = None,
 ) -> list[dict[str, Any]]:
 	dataset_name = dataset_name.strip()
 	if not dataset_name:
@@ -313,7 +372,17 @@ def sample_dataset_records(
 		candidate_indices = list(range(len(records)))
 
 	rng = random.Random(seed)
-	selected_indices = rng.sample(candidate_indices, count)
+	selected_indices = (
+		stratified_sample_indices(
+			records,
+			candidate_indices,
+			count,
+			stratify_labels,
+			rng,
+		)
+		if stratify_labels
+		else rng.sample(candidate_indices, count)
+	)
 	source_dataset = dataset_label(source_root)
 	if prompts is not None:
 		selected_prompts = [rng.choice(prompts) for _ in selected_indices]
@@ -333,6 +402,7 @@ def sample_dataset_records(
 	output_records: list[dict[str, Any]] = []
 	for offset, (index, prompt) in enumerate(zip(selected_indices, selected_prompts)):
 		record = copy.deepcopy(records[index])
+		record.setdefault("label", {})
 		original_id = str(record.get("id", index))
 		record["id"] = str(next_id + offset)
 		record["source_id"] = original_id
@@ -370,6 +440,15 @@ def parse_args() -> argparse.Namespace:
 		type=int,
 		required=True,
 		help="Number of dataset records to sample",
+	)
+	parser.add_argument(
+		"--stratify-labels",
+		nargs="+",
+		default=None,
+		help=(
+			"Label keys whose joint values define near-equal sampling strata; "
+			"the final per-stratum counts differ by at most one."
+		),
 	)
 	parser.add_argument(
 		"--prompt-file",
@@ -429,6 +508,7 @@ def main() -> None:
 		seed=args.seed,
 		existing_records=existing_records,
 		data_root=data_root,
+		stratify_labels=args.stratify_labels,
 	)
 
 	all_records = existing_records + new_records

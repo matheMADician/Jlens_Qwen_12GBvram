@@ -1,4 +1,4 @@
-import os, sys, torch, json, logging, csv, tempfile
+import os, sys, torch, json, logging, csv, tempfile, math
 from dataclasses import asdict
 
 import model.model as M
@@ -6,8 +6,50 @@ from audio_jlens.jlens import Jlens
 from json_parser import Parser
 from tools.experiments import Experiments, JlensComparison
 from tools.math_tools import MathTools
+from jacobian_lens.jlens.lens import JacobianLens
 
 class Master:
+    @staticmethod
+    def _merge_lenses(lens_paths: list[str], method: str) -> JacobianLens:
+        lenses = [JacobianLens.load(path) for path in lens_paths]
+        if not lenses:
+            raise ValueError("At least one input JLens checkpoint is required.")
+        if method == "original":
+            return JacobianLens.merge(lenses)
+        if method != "equal":
+            raise ValueError(f"Unknown JLens merge method: {method!r}")
+        first = lenses[0]
+        for other in lenses[1:]:
+            if (
+                other.source_layers != first.source_layers
+                or other.d_model != first.d_model
+            ):
+                raise ValueError("lenses disagree on source_layers / d_model")
+        jacobians = {
+            layer: torch.stack([lens.jacobians[layer] for lens in lenses]).mean(0)
+            for layer in first.source_layers
+        }
+        return JacobianLens(
+            jacobians=jacobians,
+            n_prompts=sum(lens.n_prompts for lens in lenses),
+            d_model=first.d_model,
+        )
+
+    @staticmethod
+    def merge_Jlens(
+        lens_paths: list[str],
+        output_path: str,
+        merge_method: str = "original",
+    ) -> str:
+        """Merge JLens checkpoints and save the result."""
+        if not lens_paths:
+            raise ValueError("At least one input JLens checkpoint is required.")
+        merged_lens = Master._merge_lenses(lens_paths, merge_method)
+        output_path = os.path.abspath(os.path.expanduser(output_path))
+        os.makedirs(os.path.dirname(output_path), exist_ok=True)
+        merged_lens.save(output_path)
+        return output_path
+
     def __init__(self, run_name: str, settings_path: str = "settings.json"):
         Master.check_dependencies()
         self.logger = logging.getLogger()
@@ -227,8 +269,10 @@ class Master:
     def calc_Jlens_experiment(
         self,
         *,
+        prompts_path: str | None = None,
         projector_pairs: list[list[int]] | None = None,
         save_projected_features: bool | None = None,
+        save_projected_blocks: bool | None = None,
         save_dataset_lenses: bool | None = None,
         save_milestone_lenses: bool | None = None,
     ):
@@ -244,10 +288,18 @@ class Master:
           - ``random_projection``: opt-in projection and per-prompt t-SNE outputs
           - ``projection_dim_seed``: projector settings as ``[dimension, seed]`` pairs
           - ``save_projected_features``: durable per-prompt features for t-SNE
+          - ``projection_block_starts``: start layer for each projected block
+          - ``save_projected_blocks``: persist per-prompt projected block matrices
           - ``save_dataset_lenses``: persist one lens per dataset (default: true)
           - ``save_milestone_lenses``: persist cumulative milestone lenses (default: true)
         """
         fitting_settings = self.settings["fitting"]
+        jsonl_path = (
+            fitting_settings["jsonl_path"] if prompts_path is None else prompts_path
+        )
+        if not isinstance(jsonl_path, str) or not jsonl_path.strip():
+            raise ValueError("The training prompts path must be a non-empty string.")
+        jsonl_path = os.path.abspath(os.path.expanduser(jsonl_path))
         experiment_settings = fitting_settings.get("experiment", {})
         if not isinstance(experiment_settings, dict):
             raise ValueError("settings.json 'fitting.experiment' must be an object")
@@ -305,6 +357,25 @@ class Master:
                 "settings.json 'fitting.experiment.save_projected_features' "
                 "must be a boolean"
             )
+        if save_projected_blocks is None:
+            save_projected_blocks = experiment_settings.get(
+                "save_projected_blocks", False
+            )
+        if not isinstance(save_projected_blocks, bool):
+            raise ValueError(
+                "settings.json 'fitting.experiment.save_projected_blocks' "
+                "must be a boolean"
+            )
+        projection_block_starts = experiment_settings.get(
+            "projection_block_starts"
+        )
+        if save_projected_blocks and not isinstance(projection_block_starts, list):
+            raise ValueError(
+                "settings.json 'fitting.experiment.projection_block_starts' "
+                "must be a list when saving projected blocks"
+            )
+        if save_projected_blocks and not random_projection:
+            raise ValueError("Saving projected blocks requires random projection.")
         if save_dataset_lenses is None:
             save_dataset_lenses = experiment_settings.get("save_dataset_lenses", True)
         if not isinstance(save_dataset_lenses, bool):
@@ -380,22 +451,31 @@ class Master:
         os.makedirs(experiment_directory, exist_ok=True)
         checkpoint_path = os.path.join(experiment_directory, "fit.pt")
         
-        # Copy settings.json to the experiment directory for reproducibility
+        # Save the effective settings, including any CLI prompt-path override.
         settings_copy_path = os.path.join(experiment_directory, "settings.json")
-        from shutil import copy
-        copy("settings.json", settings_copy_path)
+        settings_to_save = {
+            **self.settings,
+            "fitting": {
+                **fitting_settings,
+                "jsonl_path": jsonl_path,
+            },
+        }
+        with open(settings_copy_path, "w", encoding="utf-8") as settings_file:
+            json.dump(settings_to_save, settings_file, indent=4)
+            settings_file.write("\n")
 
         # Fit
         self.logger.info(
             "Starting experiment JLens fit: seed=%d, max_prompts=%s, "
-            "milestones=%s, output=%s",
+            "milestones=%s, prompts=%s, output=%s",
             seed,
             max_prompts,
             milestone_counts,
+            jsonl_path,
             experiment_directory,
         )
         fit_result = self.model.fit_Jlens_for_experiment(
-            jsonl_path=os.path.abspath(fitting_settings["jsonl_path"]),
+            jsonl_path=jsonl_path,
             data_root=self._configured_data_root(),
             seed=seed,
             dim_batch=fitting_settings.get("dim_batch", 32),
@@ -410,12 +490,13 @@ class Master:
             random_projection=random_projection,
             projection_dim_seed=projection_dim_seed if random_projection else None,
             save_projected_features=save_projected_features,
+            save_projected_blocks=save_projected_blocks,
+            projection_block_starts=projection_block_starts,
             save_dataset_lenses=save_dataset_lenses,
             save_milestone_lenses=save_milestone_lenses,
         )
         if random_projection and save_projected_features:
             from tools.projection_tsne import create_projection_tsne
-            from audio_jlens.random_proj import delete_saved_prompt_features
 
             for projection_dim, projection_seed in projection_dim_seed:
                 projected_dir = os.path.join(
@@ -425,13 +506,26 @@ class Master:
                 )
                 plot_path = os.path.join(projected_dir, "tsne.png")
                 embedding_path = os.path.join(projected_dir, "tsne_embedding.npz")
+                normalized_plot_path = os.path.join(
+                    projected_dir, "tsne_normalized.png"
+                )
+                normalized_embedding_path = os.path.join(
+                    projected_dir, "tsne_normalized_embedding.npz"
+                )
                 feature_files = [
                     name
                     for name in os.listdir(projected_dir)
                     if name.startswith("dataset_") and name.endswith(".npz")
                 ]
-                if os.path.isfile(plot_path) and os.path.isfile(embedding_path):
-                    delete_saved_prompt_features(projected_dir)
+                if all(
+                    os.path.isfile(path)
+                    for path in (
+                        plot_path,
+                        embedding_path,
+                        normalized_plot_path,
+                        normalized_embedding_path,
+                    )
+                ):
                     self.logger.info(
                         "t-SNE already exists for dim=%d seed=%d; skipping",
                         projection_dim,
@@ -441,22 +535,28 @@ class Master:
                 if not feature_files:
                     raise FileNotFoundError(
                         "Per-prompt projected features are unavailable for t-SNE "
-                        f"in {projected_dir}. They may have been cleaned after a "
-                        "previous successful visualization."
+                        f"in {projected_dir}. Re-run the fit with "
+                        "save_projected_features enabled."
                     )
-                plot_path, embedding_path = create_projection_tsne(
+                output_paths = create_projection_tsne(
                     projected_dir,
                     perplexity=float(tsne_perplexity),
                     random_state=projection_seed,
                 )
-                delete_saved_prompt_features(projected_dir)
+                (
+                    plot_path,
+                    embedding_path,
+                    normalized_plot_path,
+                    normalized_embedding_path,
+                ) = next(iter(output_paths.values()))
                 self.logger.info(
-                    "Saved t-SNE for dim=%d seed=%d to %s and %s; removed raw "
-                    "per-prompt feature files",
+                    "Saved raw and normalized t-SNE for dim=%d seed=%d to %s, %s, %s, and %s",
                     projection_dim,
                     projection_seed,
                     plot_path,
                     embedding_path,
+                    normalized_plot_path,
+                    normalized_embedding_path,
                 )
         return fit_result
     
@@ -473,10 +573,34 @@ class Master:
         lens_path: str,
         device: str | torch.device | None = None,
         svd_device: str | torch.device = "cpu",
+        use_j_vectors: bool = False,
+        compute_svd: bool = True,
+        use_norm_scaling: bool = True,
     ) -> dict[str, object]:
-        """Compute and save all single-lens cosine, CKA, and SVD heatmaps."""
+        """Compute and save cosine, CKA, and optionally SVD heatmaps.
+
+        SVD result keys are omitted when ``compute_svd`` is false.
+        """
+        if not use_j_vectors and not use_norm_scaling:
+            raise ValueError("Disabling norm scaling requires J-vector analysis.")
         task_name = self.run_name or "default"
         matrix_settings = self.settings["experiment"]["matrix_analysis"]
+        cka_range = matrix_settings.get("cka_color_range", [0.0, 1.0])
+        if (
+            not isinstance(cka_range, list)
+            or len(cka_range) != 2
+            or any(
+                isinstance(value, bool)
+                or not isinstance(value, (int, float))
+                or not math.isfinite(value)
+                for value in cka_range
+            )
+            or not 0 <= cka_range[0] < cka_range[1] <= 1
+        ):
+            raise ValueError(
+                "experiment.matrix_analysis.cka_color_range must contain "
+                "two finite numbers with 0 <= min < max <= 1."
+            )
         output_dir = self._experiment_analysis_dir("single_lens")
         os.makedirs(output_dir, exist_ok=True)
         
@@ -488,6 +612,18 @@ class Master:
 
         jacobians = lens.get_jacobian()
         layers = list(lens.lens.source_layers)
+        readout_weights = None
+        if use_j_vectors:
+            self.logger.info(
+                "Loading the configured model to compute token-specific J-vectors."
+            )
+            output_weights, norm_weight = (
+                self.model.load_model().get_unembedding_weights()
+            )
+            readout_weights = (
+                output_weights,
+                norm_weight if use_norm_scaling else None,
+            )
         analysis = Experiments.info_Jlens(
             logger=self.logger,
             jacobians=jacobians,
@@ -495,90 +631,108 @@ class Master:
             svd_top_k=svd_top_k,
             device=device,
             svd_device=svd_device,
+            readout_weights=readout_weights,
+            compute_svd=compute_svd,
         )
         # Validate the structure and types of the analysis results
         layers = analysis["layers"]
         assert isinstance(layers, list) and all(isinstance(layer, int) for layer in layers)
         assert isinstance(analysis["cosine_heatmap"], torch.Tensor)
         assert isinstance(analysis["cka_heatmap"], torch.Tensor)
-        assert isinstance(analysis["svd_spectra"], torch.Tensor)
-        assert isinstance(analysis["svd_adjacent_cosines"], torch.Tensor)
-        assert isinstance(analysis["svd_layers"], list) and all(isinstance(layer, int) for layer in analysis["svd_layers"])
-        assert isinstance(analysis["svd_layer_pairs"], list) and all(isinstance(pair, str) for pair in analysis["svd_layer_pairs"])
+        similarity_suffix = "_j_vectors" if use_j_vectors else ""
+        similarity_title = "J-vector" if use_j_vectors else "Jacobian"
+        if use_j_vectors and not use_norm_scaling:
+            similarity_suffix += "_no_norm_scaling"
+            similarity_title += " (no norm scaling)"
         # Draw the heatmaps
         MathTools.draw_heatmap(
             data=analysis["cosine_heatmap"],
-            png_path=os.path.join(output_dir, f"{task_name}_cosine.png"),
+            png_path=os.path.join(
+                output_dir, f"{task_name}{similarity_suffix}_cosine.png"
+            ),
             x_labels=layers,
             y_labels=layers,
-            title="JLens Jacobian cosine similarity",
+            title=f"JLens {similarity_title} cosine similarity",
         )
         MathTools.draw_heatmap(
             data=analysis["cka_heatmap"],
-            png_path=os.path.join(output_dir, f"{task_name}_cka.png"),
+            png_path=os.path.join(
+                output_dir, f"{task_name}{similarity_suffix}_cka.png"
+            ),
             x_labels=layers,
             y_labels=layers,
-            title="JLens Jacobian CKA similarity",
+            title=f"JLens {similarity_title} CKA similarity",
             colorbar_label="CKA similarity",
             cmap="viridis",
-            vmin=0.0,
-            vmax=1.0,
+            vmin=cka_range[0],
+            vmax=cka_range[1],
         )
 
-        svd_output_dir = os.path.join(
-            output_dir,
-            "SVD_analysis",
-        )
-        os.makedirs(svd_output_dir, exist_ok=True)
-        spectra = analysis["svd_spectra"]
-        log_spectra = spectra.clamp_min(
-            torch.finfo(spectra.dtype).tiny
-        ).log10()
-        
-        MathTools.draw_heatmap(
-            data=log_spectra,
-            png_path=os.path.join(svd_output_dir, f"{task_name}_spectrum.png"),
-            x_labels=list(range(log_spectra.shape[1])),
-            y_labels=analysis["svd_layers"],
-            title="Jacobian singular-value spectra",
-            x_axis_label="Singular value index",
-            y_axis_label="Layer",
-            colorbar_label="log10(singular value)",
-            cmap="magma",
-            vmin=None,
-            vmax=None,
-        )
-        MathTools.draw_heatmap(
-            data=analysis["svd_adjacent_cosines"],
-            png_path=os.path.join(
-                svd_output_dir,
-                f"{task_name}_adjacent_subspace.png",
-            ),
-            x_labels=list(range(1, svd_top_k + 1)),
-            y_labels=analysis["svd_layer_pairs"],
-            title=f"Adjacent-layer top-{svd_top_k} left-singular subspaces",
-            x_axis_label="Principal cosine rank",
-            y_axis_label="Adjacent layer pair",
-            colorbar_label="Principal cosine",
-            cmap="viridis",
-            vmin=0.0,
-            vmax=1.0,
-        )
+        if compute_svd:
+            assert isinstance(analysis["svd_spectra"], torch.Tensor)
+            assert isinstance(analysis["svd_adjacent_cosines"], torch.Tensor)
+            assert isinstance(analysis["svd_layers"], list) and all(isinstance(layer, int) for layer in analysis["svd_layers"])
+            assert isinstance(analysis["svd_layer_pairs"], list) and all(isinstance(pair, str) for pair in analysis["svd_layer_pairs"])
+            svd_output_dir = os.path.join(output_dir, "SVD_analysis")
+            os.makedirs(svd_output_dir, exist_ok=True)
+            spectra = analysis["svd_spectra"]
+            log_spectra = spectra.clamp_min(
+                torch.finfo(spectra.dtype).tiny
+            ).log10()
+
+            MathTools.draw_heatmap(
+                data=log_spectra,
+                png_path=os.path.join(svd_output_dir, f"{task_name}_spectrum.png"),
+                x_labels=list(range(log_spectra.shape[1])),
+                y_labels=analysis["svd_layers"],
+                title="Jacobian singular-value spectra",
+                x_axis_label="Singular value index",
+                y_axis_label="Layer",
+                colorbar_label="log10(singular value)",
+                cmap="magma",
+                vmin=None,
+                vmax=None,
+            )
+            MathTools.draw_heatmap(
+                data=analysis["svd_adjacent_cosines"],
+                png_path=os.path.join(
+                    svd_output_dir,
+                    f"{task_name}_adjacent_subspace.png",
+                ),
+                x_labels=list(range(1, svd_top_k + 1)),
+                y_labels=analysis["svd_layer_pairs"],
+                title=f"Adjacent-layer top-{svd_top_k} left-singular subspaces",
+                x_axis_label="Principal cosine rank",
+                y_axis_label="Adjacent layer pair",
+                colorbar_label="Principal cosine",
+                cmap="viridis",
+                vmin=0.0,
+                vmax=1.0,
+            )
         self.logger.info("Saved single-lens heatmaps to %s", output_dir)
         return analysis
     
-    def comp_Jlens(self, lens_path1: str, lens_path2: str) -> str:
-        """Compare matching Jacobian layers and save metrics in the two-lens run folder."""
-        from audio_jlens.random_proj import validate_projection_compatibility
+    def comp_Jlens(
+        self,
+        lens_paths1: list[str],
+        lens_paths2: list[str],
+        *,
+        use_j_vectors: bool = False,
+        use_norm_scaling: bool = True,
+        merge_method: str = "original",
+    ) -> str:
+        """Compare matching Jacobians or their vocabulary-space J-vectors."""
+        if not use_j_vectors and not use_norm_scaling:
+            raise ValueError("Disabling norm scaling requires J-vector comparison.")
+        from jacobian_lens.jlens.lens import JacobianLens
 
-        validate_projection_compatibility(lens_path1, lens_path2)
-        lens1 = Jlens(logger=self.logger)
-        lens2 = Jlens(logger=self.logger)
-        lens1.load_lens(path=lens_path1)
-        lens2.load_lens(path=lens_path2)
+        if not lens_paths1 or not lens_paths2:
+            raise ValueError("Both lens groups must contain at least one checkpoint.")
+        lens1 = self._merge_lenses(lens_paths1, merge_method)
+        lens2 = self._merge_lenses(lens_paths2, merge_method)
 
-        jacobians1 = lens1.get_jacobian()
-        jacobians2 = lens2.get_jacobian()
+        jacobians1 = lens1.jacobians
+        jacobians2 = lens2.jacobians
         layers1 = sorted(jacobians1)
         layers2 = sorted(jacobians2)
         if layers1 != layers2:
@@ -588,6 +742,30 @@ class Master:
             )
         if not layers1:
             raise ValueError("Cannot compare JLens checkpoints with no Jacobian layers.")
+
+        suffix = ""
+        if use_j_vectors:
+            output_weights, norm_weight = (
+                self.model.load_model().get_unembedding_weights()
+            )
+            output_weights = output_weights.to(dtype=torch.float32)
+            if use_norm_scaling:
+                output_weights = output_weights * norm_weight.to(
+                    device=output_weights.device, dtype=torch.float32
+                )
+            jacobians1 = {
+                layer: output_weights @ jacobians1[layer].to(
+                    device=output_weights.device, dtype=torch.float32
+                )
+                for layer in layers1
+            }
+            jacobians2 = {
+                layer: output_weights @ jacobians2[layer].to(
+                    device=output_weights.device, dtype=torch.float32
+                )
+                for layer in layers2
+            }
+            suffix = "_j_vectors" + ("" if use_norm_scaling else "_no_norm_scaling")
 
         comparisons = [
             Experiments.compare_jacobians(
@@ -599,9 +777,9 @@ class Master:
 
         output_dir = self._experiment_analysis_dir("two_lens")
         os.makedirs(output_dir, exist_ok=True)
-        lens1_name = os.path.splitext(os.path.basename(lens_path1))[0]
-        lens2_name = os.path.splitext(os.path.basename(lens_path2))[0]
-        output_name = f"comparison_{lens1_name}_vs_{lens2_name}"
+        lens1_name = os.path.splitext(os.path.basename(lens_paths1[0]))[0]
+        lens2_name = os.path.splitext(os.path.basename(lens_paths2[0]))[0]
+        output_name = f"comparison_{lens1_name}_vs_{lens2_name}{suffix}"
         rows = [
             {"layer": layer, **asdict(comparison)}
             for layer, comparison in zip(layers1, comparisons)
@@ -623,8 +801,8 @@ class Master:
         with open(report_path, "w", encoding="utf-8") as report_file:
             json.dump(
                 {
-                    "lens1": lens_path1,
-                    "lens2": lens_path2,
+                    "lens1": lens_paths1,
+                    "lens2": lens_paths2,
                     "layers": rows,
                 },
                 report_file,
@@ -643,7 +821,11 @@ class Master:
             },
             png_path=similarity_plot_path,
             x_values=layers1,
-            title="Same-layer JLens Jacobian cosine similarity",
+            title=(
+                "Same-layer JLens J-vector cosine similarity"
+                if use_j_vectors
+                else "Same-layer JLens Jacobian cosine similarity"
+            ),
             x_axis_label="Layer",
             y_axis_label="Cosine similarity",
         )
@@ -664,7 +846,11 @@ class Master:
             },
             png_path=relative_difference_plot_path,
             x_values=layers1,
-            title="Relative JLens Jacobian differences",
+            title=(
+                "Relative JLens J-vector differences"
+                if use_j_vectors
+                else "Relative JLens Jacobian differences"
+            ),
             x_axis_label="Layer",
             y_axis_label="Relative difference",
         )
@@ -813,10 +999,12 @@ class Master:
         
     def eval_Jlens(
         self,
-        lens_path: str,
+        lens_paths: list[str],
         prompts_path: str,
         top_k: int | None = None,
         layer: int | None = None,
+        merge_method: str = "original",
+        target: str = "transcript",
     ) -> str:
         """Evaluate pass@k with both JLens and LogitLens predictions."""
         # Prepare evaluation and output settings.
@@ -830,16 +1018,23 @@ class Master:
         )
 
         # Evaluate both lenses on the prompt set.
+        from jacobian_lens.jlens.lens import JacobianLens
+
+        if not lens_paths:
+            raise ValueError("At least one lens checkpoint is required.")
+        merged_lens = self._merge_lenses(lens_paths, merge_method)
+        self.model.lens = J.Jlens(logger=self.logger)
+        self.model.lens.lens = merged_lens
         evaluation = Experiments.passk_Jlens(
             logger=self.logger,
             model=self.model,
             run_name=task_name,
-            lens_path=lens_path,
             prompts_path=prompts_path,
             data_root=self._configured_data_root(),
             top_k=csv_top_k,
             k_values=k_values,
             layer=layer,
+            target=target,
         )
 
         # Separate and validate prediction rows.

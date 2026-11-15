@@ -152,6 +152,10 @@ class Instance(BaseInstance):
             * self.text_model.norm.weight.float()
         )
 
+    def get_unembedding_weights(self) -> tuple[torch.Tensor, torch.Tensor]:
+        hf_model, _ = self.get_model()
+        return hf_model.lm_head.weight, self.text_model.norm.weight
+
 
 def load_model(
     model_id: str, do_4bit: bool = False

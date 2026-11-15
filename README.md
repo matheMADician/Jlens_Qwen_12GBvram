@@ -295,8 +295,8 @@ milestone 儲存選項必須與 checkpoint 一致。
 `tsne.png` 和 `tsne_embedding.npz`。dataset 檔案包含每個 prompt 跨 source
 layers 串接後的投影 features、prompt ID、dataset label 和投影 metadata。
 per-prompt features 會逐筆寫入 projector 的暫存 cache，支援跨 server time limit
-resume；完成 fitting 後合併成 dataset `.npz`，t-SNE 成功後刪除這些大型原始
-features，只保留 embedding、圖、投影矩陣和 projected combined lens。
+resume；完成 fitting 後合併成 dataset `.npz` 並清除暫存 cache；dataset `.npz` 在 t-SNE
+後仍會保留，並與 embedding、圖、投影矩陣和 projected combined lens 放在一起。
 每次啟用 per-prompt features 時請只選一個 projector，並為不同 dimension/seed
 使用不同 `--run-name`：
 
@@ -367,6 +367,20 @@ checkpoint 時，會產生 `lens1 layer × lens2 layer` 比較圖。計算會在
 `single_lens/`；`comp_Jlens()` 的比較表、JSON 報告、cosine similarity、
 relative difference 和 subspace alignment 圖存於 `two_lens/`。pass@k 與
 inference 輸出仍使用各自原本設定的輸出根目錄。
+
+`python main.py info-jlens --lens-path <path> --use-j-vectors` 會載入設定中的
+模型，使用所有經 final norm 縮放的 token unembedding vectors 乘上各層
+Jacobian，計算 J-vector cosine 與 CKA。此模式會額外載入模型；輸出檔名加上
+`_j_vectors` 的 cosine/CKA 檔案不會覆蓋原本以 Jacobian matrix 計算的結果。
+SVD 分析仍使用 Jacobian matrices。
+`experiment.matrix_analysis.cka_color_range` 控制 `info-jlens` 的 CKA 色階：
+目前設定為 `[0.5, 1]`，可改回 `[0, 1]`；舊設定檔若沒有此欄位則使用
+`[0, 1]`。超出色階範圍的值會以端點顏色顯示，但 CKA 數值本身不變。
+若要改用未乘 final norm 權重的 \(W_U J\)，請在 `--use-j-vectors` 之外加上
+`--no-norm-scaling`。此模式的 cosine/CKA 檔名會加上
+`_j_vectors_no_norm_scaling`，不會覆蓋預設的縮放版本。
+若只需要 cosine 與 CKA，可加上 `--no-svd` 跳過 SVD 計算與繪圖；不加此
+選項時，預設仍會執行 SVD。此選項可與 `--use-j-vectors` 一起使用。
 
 pass@k 會在每個 prompt 的所有輸入位置中尋找答案 token 的最低排名；指定
 `layer` 時只評估該層，未指定時則在所有可用層中取最佳排名。執行

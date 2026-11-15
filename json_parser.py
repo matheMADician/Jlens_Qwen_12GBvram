@@ -1,7 +1,7 @@
 import os, json, librosa
 from pathlib import Path
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 @dataclass(frozen=True)
 class ParsedSample:
@@ -10,6 +10,7 @@ class ParsedSample:
     prompt: str
     transcript: str | None
     dataset_name: str | None
+    label: dict[str, str | list[str]] = field(default_factory=dict)
     
 class Parser:
     """
@@ -68,6 +69,7 @@ class Parser:
                 }
             ],
             "transcript": "(c) Leaping between surfaces",
+            "label": {"animal": "dog", "behavior": ["barking", "running"]},
             "source_id": "sample-000298",
             "dataset_name": "SAKURA_AnimalQA",
             "source_dataset": "SAKURA/AnimalQA"
@@ -92,6 +94,21 @@ class Parser:
         if text_end_token:
             text_prompt = text_prompt + text_end_token
         safe_text = text_prompt.replace("\n", "\\n")
+
+        label = record.get("label", {})
+        if not isinstance(label, dict):
+            raise ValueError(
+                f"樣本 {id} 的 label 必須是字串鍵對應字串或字串列表的字典"
+            )
+        for name, value in label.items():
+            if not isinstance(name, str) or not (
+                isinstance(value, str)
+                or isinstance(value, list)
+                and all(isinstance(item, str) for item in value)
+            ):
+                raise ValueError(
+                    f"樣本 {id} 的 label 必須是字串鍵對應字串或字串列表的字典"
+                )
         
         parsed_sample = ParsedSample(
             sample_id=id,
@@ -99,6 +116,7 @@ class Parser:
             prompt=safe_text,
             transcript=record.get("transcript"),
             dataset_name=record.get("dataset_name"),
+            label=dict(label),
         )
 
         return parsed_sample
@@ -113,6 +131,7 @@ class Parser:
         * A prompt that is already templated (contains <|im_start|>) is returned unchanged.
         """
         # Only compatible with Qwen2.5-Omni
+        # Other models need reprocessing
         conversation = [{
             "role": "user",
             "content": [

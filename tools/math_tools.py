@@ -34,6 +34,137 @@ class MathTools:
         return (v1_flat @ v2_flat / (v1_norm * v2_norm)).item()
 
     @staticmethod
+    @torch.no_grad()
+    def j_vector_similarities(
+        l1: dict[int, Tensor],
+        l2: dict[int, Tensor],
+        d1: Sequence[int],
+        d2: Sequence[int],
+        output_weights: Tensor,
+        norm_weight: Tensor | None,
+        device: str | torch.device | None = None,
+        chunk_size: int = 1024,
+    ) -> tuple[Tensor, Tensor]:
+        """Compute cosine and linear CKA for all token-specific output J-vectors.
+
+        Each output vector is an unembedding row multiplied by a layer Jacobian.
+        If provided, norm_weight scales the readout before applying the Jacobian.
+        Readout rows are accumulated in chunks so the full vocabulary-by-model-
+        width J-vector matrix is never materialized.
+        """
+        if not d1 or not d2:
+            empty_result = torch.empty((len(d1), len(d2)))
+            return empty_result, empty_result.clone()
+        if output_weights.ndim != 2:
+            raise ValueError("Output weights must be a matrix.")
+        if norm_weight is not None and (
+            norm_weight.ndim != 1 or output_weights.shape[1] != norm_weight.numel()
+        ):
+            raise ValueError("Norm weight must be a vector matching the output width.")
+        if output_weights.device.type == "meta" or (
+            norm_weight is not None and norm_weight.device.type == "meta"
+        ):
+            raise ValueError("Cannot analyze J-vectors with offloaded meta weights.")
+        if chunk_size < 1:
+            raise ValueError("chunk_size must be positive.")
+        if output_weights.shape[0] < 2:
+            raise ValueError("J-vector CKA requires at least two output tokens.")
+
+        compute_device = torch.device(
+            device
+            if device is not None
+            else ("cuda" if torch.cuda.is_available() else "cpu")
+        )
+        width = output_weights.shape[1]
+        norm_scale = (
+            norm_weight.detach().to(device=compute_device, dtype=torch.float32)
+            if norm_weight is not None
+            else None
+        )
+        readout_gram = torch.zeros(
+            (width, width), device=compute_device, dtype=torch.float32
+        )
+        readout_sum = torch.zeros(width, device=compute_device, dtype=torch.float32)
+        for start in range(0, output_weights.shape[0], chunk_size):
+            rows = output_weights[start : start + chunk_size].detach().to(
+                device=compute_device, dtype=torch.float32
+            )
+            if norm_scale is not None:
+                rows = rows * norm_scale
+            readout_gram.addmm_(rows.T, rows)
+            readout_sum.add_(rows.sum(dim=0))
+
+        centered_gram = readout_gram - torch.outer(
+            readout_sum, readout_sum
+        ) / output_weights.shape[0]
+        centered_gram = (centered_gram + centered_gram.T) * 0.5
+
+        def prepare(
+            jacobians: dict[int, Tensor], layers: Sequence[int]
+        ) -> tuple[dict[int, Tensor], dict[int, Tensor], dict[int, Tensor]]:
+            prepared: dict[int, Tensor] = {}
+            cosine_norms: dict[int, Tensor] = {}
+            cka_norms: dict[int, Tensor] = {}
+            for layer in layers:
+                matrix = jacobians[layer]
+                if matrix.shape != (width, width):
+                    raise ValueError(
+                        f"Jacobian at layer {layer} has shape {tuple(matrix.shape)}; "
+                        f"expected {(width, width)}."
+                    )
+                matrix = matrix.to(device=compute_device, dtype=torch.float32)
+                gram_product = readout_gram @ matrix
+                cosine_norm_sq = (matrix * gram_product).sum()
+                if cosine_norm_sq <= 0:
+                    raise ValueError(
+                        f"J-vector cosine is undefined for a zero representation "
+                        f"at layer {layer}."
+                    )
+                centered_product = centered_gram @ matrix
+                covariance_norm = torch.linalg.matrix_norm(
+                    matrix.T @ centered_product
+                )
+                if covariance_norm == 0:
+                    raise ValueError(
+                        f"J-vector CKA is undefined for a constant representation "
+                        f"at layer {layer}."
+                    )
+                prepared[layer] = matrix
+                cosine_norms[layer] = cosine_norm_sq
+                cka_norms[layer] = covariance_norm
+            return prepared, cosine_norms, cka_norms
+
+        prepared1, cosine_norms1, cka_norms1 = prepare(l1, d1)
+        if l1 is l2 and d1 == d2:
+            prepared2, cosine_norms2, cka_norms2 = (
+                prepared1,
+                cosine_norms1,
+                cka_norms1,
+            )
+        else:
+            prepared2, cosine_norms2, cka_norms2 = prepare(l2, d2)
+
+        cosine = torch.empty((len(d1), len(d2)), device=compute_device)
+        cka = torch.empty_like(cosine)
+        for column, layer2 in enumerate(d2):
+            matrix2 = prepared2[layer2]
+            gram_product2 = readout_gram @ matrix2
+            centered_product2 = centered_gram @ matrix2
+            for row, layer1 in enumerate(d1):
+                matrix1 = prepared1[layer1]
+                cosine[row, column] = (
+                    (matrix1 * gram_product2).sum()
+                    / (cosine_norms1[layer1] * cosine_norms2[layer2]).sqrt()
+                )
+                cross_covariance = matrix1.T @ centered_product2
+                cka[row, column] = (
+                    torch.linalg.matrix_norm(cross_covariance).square()
+                    / (cka_norms1[layer1] * cka_norms2[layer2])
+                )
+
+        return cosine.cpu(), cka.cpu()
+
+    @staticmethod
     def cka_similarity(
         l1: dict[int, Tensor],
         l2: dict[int, Tensor],

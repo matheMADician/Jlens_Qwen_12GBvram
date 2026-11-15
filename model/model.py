@@ -420,6 +420,8 @@ class Model:
         random_projection: bool = False,
         projection_dim_seed: list[list[int]] | None = None,
         save_projected_features: bool = True,
+        save_projected_blocks: bool = False,
+        projection_block_starts: list[int] | None = None,
         save_dataset_lenses: bool = True,
         save_milestone_lenses: bool = True,
     ) -> tuple[JacobianLens, dict[str, JacobianLens], dict[int, JacobianLens]]:
@@ -522,6 +524,8 @@ class Model:
             data_root=audio_root,
             projectors=projectors,
             save_projected_features=save_projected_features,
+            save_projected_blocks=save_projected_blocks,
+            projection_block_starts=projection_block_starts,
             save_dataset_lenses=save_dataset_lenses,
             save_milestone_lenses=save_milestone_lenses,
         )

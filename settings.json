@@ -8,7 +8,7 @@
         "root": "data",
         "jsonl_path": "data/assembled/train_upscale_1/prompts.jsonl",
         "max_seq_len": 3000,
-        "dim_batch": 32,
+        "dim_batch": 8,
         "checkpoint_interval": 5,
         "checkpoint_root": "output/checkpoints",
         "experiment": {
@@ -19,6 +19,8 @@
             "random_projection": true,
             "projection_dim_seed": [[128, 42]],
             "save_projected_features": true,
+            "projection_block_starts": [0, 21, 26],
+            "save_projected_blocks": false,
             "save_dataset_lenses": true,
             "save_milestone_lenses": true,
             "tsne_perplexity": 30.0,
@@ -34,6 +36,7 @@
     "experiment": {
         "matrix_analysis": {
             "SVD_top_k": 8,
+            "cka_color_range": [0.5, 1],
             "output_root": "output/experiments"
         },
         "pass_k_AUC": {

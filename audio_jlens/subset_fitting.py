@@ -57,12 +57,14 @@ from audio_jlens.random_proj import GaussianRandomProjector as GP
 
 logger = logging.getLogger(__name__)
 
+# Original jacobian_lens imports
 from jacobian_lens.jlens.hooks import ActivationRecorder
 from jacobian_lens.jlens.lens import JacobianLens
 from jacobian_lens.jlens.protocol import LensModel
 
 # Original fitting.py methods
 from jacobian_lens.jlens.fitting import jacobian_for_prompt, _check_layer_indices, valid_position_mask, _atomic_save, fit
+
 from json_parser import Parser
 
 
@@ -119,7 +121,10 @@ def _text_suffix_token_count(
     )
     return int(text_tokens["input_ids"].shape[1])
 
-
+#TODO This does not take into account the chat template
+# This needs to split prompt into four parts:
+# 1. System prompt 2. User audio 3. User text 4. Assistant part(from the prompt)
+# And possibly 5. Model output, if this is to be included in the experiment
 def subset_jacobian_for_prompt(
     model: LensModel,
     subset_config: SubsetConfig,
@@ -352,6 +357,8 @@ def subset_fit_experiment(
     *,
     projectors: list[GP] | None = None,
     save_projected_features: bool = True,
+    save_projected_blocks: bool = False,
+    projection_block_starts: Sequence[int] | None = None,
     save_dataset_lenses: bool = True,
     save_milestone_lenses: bool = True,
 ) -> tuple[JacobianLens, dict[str, JacobianLens], dict[int, JacobianLens]]:
@@ -444,6 +451,42 @@ def subset_fit_experiment(
     source_layers, target_layer = _check_layer_indices(
         source_layers, target_layer, n_layers
     )
+    block_layer_ranges: tuple[tuple[int, int], ...] | None = None
+    if save_projected_blocks:
+        if not save_projected_features or not projectors:
+            raise ValueError(
+                "Saving projected blocks requires projected-feature saving "
+                "and exactly one projector."
+            )
+        if len(projectors) != 1:
+            raise ValueError("Saving projected blocks requires exactly one projector.")
+        if not projection_block_starts:
+            raise ValueError(
+                "projection_block_starts must be set when saving projected blocks."
+            )
+        layers = list(source_layers)
+        starts = list(projection_block_starts)
+        if layers != list(range(layers[0], layers[-1] + 1)):
+            raise ValueError("Projected blocks require contiguous source layers.")
+        if (
+            starts[0] != layers[0]
+            or any(not isinstance(start, int) or isinstance(start, bool) for start in starts)
+            or starts != sorted(set(starts))
+            or any(start not in layers for start in starts)
+        ):
+            raise ValueError(
+                "projection_block_starts must be strictly increasing source-layer "
+                "indices beginning with the first source layer."
+            )
+        block_layer_ranges = tuple(
+            (
+                start,
+                starts[index + 1] - 1
+                if index + 1 < len(starts)
+                else layers[-1],
+            )
+            for index, start in enumerate(starts)
+        )
 
     if projectors is not None:
         if not projectors:
@@ -548,6 +591,19 @@ def subset_fit_experiment(
                 "save_projected_features setting; use a new run name or "
                 "pass resume=False"
             )
+        if state.get("save_projected_blocks", False) != save_projected_blocks:
+            raise ValueError(
+                f"checkpoint at {checkpoint_path} has a different "
+                "save_projected_blocks setting; use a new run name or "
+                "pass resume=False"
+            )
+        if state.get("projection_block_starts") != (
+            list(projection_block_starts) if save_projected_blocks else None
+        ):
+            raise ValueError(
+                f"checkpoint at {checkpoint_path} has different projection block "
+                "definitions; use a new run name or pass resume=False"
+            )
         if state.get("save_milestone_lenses", True) != save_milestone_lenses:
             raise ValueError(
                 f"checkpoint at {checkpoint_path} has a different "
@@ -604,7 +660,9 @@ def subset_fit_experiment(
     if projected_root and projectors is not None:
         for projector in projectors:
             projector.save_projection_matrix(
-                projected_root, source_layers=source_layers
+                projected_root,
+                source_layers=source_layers,
+                block_layer_ranges=block_layer_ranges,
             )
 
     def write_checkpoint() -> None:
@@ -627,6 +685,10 @@ def subset_fit_experiment(
                     else []
                 ),
                 "save_projected_features": save_projected_features,
+                "save_projected_blocks": save_projected_blocks,
+                "projection_block_starts": (
+                    list(projection_block_starts) if save_projected_blocks else None
+                ),
                 "save_milestone_lenses": save_milestone_lenses,
                 "fit_complete": fit_complete,
             }
@@ -689,6 +751,10 @@ def subset_fit_experiment(
                     source_layers,
                     sample_id=prompt_id,
                     dataset_name=dataset_name,
+                    label=parsed_sample.label,
+                    block_starts=(
+                        projection_block_starts if save_projected_blocks else None
+                    ),
                     prompt_index=prompt_idx,
                     cache_dir=projector.feature_cache_directory(projected_root),
                 )
@@ -733,6 +799,7 @@ def subset_fit_experiment(
         dataset_lenses[ds_name] = ds_lens
         if datasets_dir:
             save_file = os.path.join(datasets_dir, f"lens_{ds_name}.pt")
+            os.makedirs(os.path.dirname(save_file), exist_ok=True)
             ds_lens.save(save_file)
             logger.info("Saved dataset lens for %s (n=%d) to %s", ds_name, cnt, save_file)
 

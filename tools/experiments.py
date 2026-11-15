@@ -1,10 +1,11 @@
 import os, math, json, random, statistics
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import torch
 from torch import Tensor, linalg
 
 from audio_jlens.jlens import Jlens
+from jacobian_lens.jlens.hooks import ActivationRecorder
 from json_parser import Parser
 from tools.math_tools import MathTools
 from tools.matrix_tools import MatrixTools, LayerSVDMetrics
@@ -16,11 +17,11 @@ SWAP_POSITION_POLICIES = ("all", "audio", "after_audio", "last")
 class passk_cache:
     """Per-prompt pass@k observations accumulated during evaluation."""
 
-    prompt_cnt: int
-    best_token_pos: list[int]
-    best_k_values: list[int]
-    best_probability: list[float]
-    best_layers: list[int]
+    prompt_cnt: int = 0
+    best_token_pos: list[int] = field(default_factory=list)
+    best_k_values: list[int] = field(default_factory=list)
+    best_probability: list[float] = field(default_factory=list)
+    best_layers: list[int] = field(default_factory=list)
     layer: int | None = None
 
 #TODO write docstring for this class
@@ -375,57 +376,106 @@ class Experiments:
         return summary
 
 
+    def _passk_target_text(sample, target: str, logger) -> str | None:
+        if target == "transcript":
+            target_text = sample.transcript
+            if target_text is None:
+                logger.warning(
+                    "Sample %s has no transcript to evaluate", sample.sample_id
+                )
+                return None
+            target_text = target_text.strip()
+            if target_text.startswith("(") and ")" in target_text:
+                target_text = target_text.split(")", 1)[1].strip()
+            return target_text
+
+        if not target.startswith("label.") or not target[len("label."):].strip():
+            raise ValueError(
+                "Pass@k target must be 'transcript' or 'label.<field>'."
+            )
+        label_key = target[len("label."):]
+        labels = sample.label
+        if not isinstance(labels, dict) or label_key not in labels:
+            raise ValueError(
+                f"Sample {sample.sample_id} has no label field {label_key!r}."
+            )
+        target_value = labels[label_key]
+        if not isinstance(target_value, str):
+            raise ValueError(
+                f"Pass@k label {label_key!r} for sample {sample.sample_id} "
+                "must be a scalar string."
+            )
+        target_text = target_value.strip()
+        if not target_text:
+            raise ValueError(
+                f"Pass@k label {label_key!r} for sample {sample.sample_id} "
+                "must not be empty."
+            )
+        return target_text
+    
     @staticmethod
     def draw_Jlens_cka_heatmap(
         logger,
         run_name: str,
         heatmap_path: str,
-        lens_path1: str,
-        lens_path2: str | None = None,
+        lens1: Jlens,
+        lens2: Jlens | None = None,
         device: str | torch.device | None = None,
+        readout_weights: tuple[Tensor, Tensor | None] | None = None,
     ) -> torch.Tensor:
-        """Draw a heatmap using cka similarity between layers.
+        """Draw a heatmap using Jacobian or output J-vector CKA between layers.
         The returned tensor is indexed as ``[lens1_layer, lens2_layer]``.
         
         The y axis represents the first lens, while the x axis does for the second.
 
         Args:
-            lens_path1 (str): Path to the first Jlens checkpoint.
-            lens_path2 (str | None, optional): If not specified, compare lens1 to itself.
+            lens1: First JLens instance, with its checkpoint already loaded.
+            lens2: If not specified, compare lens1 to itself.
             device: Device for CKA calculation. Defaults to CUDA when available.
         """
-        if lens_path2 is not None:
-            from audio_jlens.random_proj import validate_projection_compatibility
-
-            validate_projection_compatibility(lens_path1, lens_path2)
         os.makedirs(heatmap_path, exist_ok=True)
         
-        lens1 = Jlens(logger)
-        lens1.load_lens(path=lens_path1)
-        lens2 = lens1 if lens_path2 is None else Jlens(logger)
-        if lens_path2 is not None:
-            lens2.load_lens(path=lens_path2)
+        lens2 = lens1 if lens2 is None else lens2
 
-        assert lens1.lens is not None
-        assert lens2.lens is not None
+        if lens1.lens is None or lens2.lens is None:
+            raise ValueError("Both JLens instances must contain a loaded lens.")
         layers1 = lens1.lens.source_layers
         layers2 = lens2.lens.source_layers
 
-        heatmap = MathTools.cka_similarity(
-            l1=lens1.lens.jacobians,
-            l2=lens2.lens.jacobians,
-            d1=layers1,
-            d2=layers2,
-            device=device,
-        )
+        if readout_weights is None:
+            heatmap = MathTools.cka_similarity(
+                l1=lens1.lens.jacobians,
+                l2=lens2.lens.jacobians,
+                d1=layers1,
+                d2=layers2,
+                device=device,
+            )
+        else:
+            _, heatmap = MathTools.j_vector_similarities(
+                l1=lens1.lens.jacobians,
+                l2=lens2.lens.jacobians,
+                d1=layers1,
+                d2=layers2,
+                output_weights=readout_weights[0],
+                norm_weight=readout_weights[1],
+                device=device,
+            )
         logger.info("Computed CKA heatmap on %s", device or ("cuda" if torch.cuda.is_available() else "cpu"))
-        
+        output_name = run_name or "heatmap"
+        if readout_weights is not None:
+            output_name += "_j_vectors"
+            if readout_weights[1] is None:
+                output_name += "_no_norm_scaling"
         MathTools.draw_heatmap(
             data=heatmap,
-            png_path=os.path.join(heatmap_path, run_name or "heatmap"),
+            png_path=os.path.join(heatmap_path, output_name),
             x_labels=layers2,
             y_labels=layers1,
-            title="JLens Jacobian cka similarity",
+            title=(
+                "JLens J-vector CKA similarity"
+                if readout_weights is not None
+                else "JLens Jacobian cka similarity"
+            ),
         )
         logger.info("Saved JLens heatmap to %s", heatmap_path)
         return heatmap
@@ -435,62 +485,73 @@ class Experiments:
         logger,
         run_name: str,
         heatmap_path: str,
-        lens_path1: str,
-        lens_path2: str | None = None,
+        lens1: Jlens,
+        lens2: Jlens | None = None,
         device: str | torch.device | None = None,
+        readout_weights: tuple[Tensor, Tensor | None] | None = None,
     ) -> torch.Tensor:
-        """Draw pairwise cosine similarities between Jacobian matrices."""
-        if lens_path2 is not None:
-            from audio_jlens.random_proj import validate_projection_compatibility
-
-            validate_projection_compatibility(lens_path1, lens_path2)
+        """Draw pairwise cosine similarities between Jacobians or their J-vectors."""
         os.makedirs(heatmap_path, exist_ok=True)
+        lens2 = lens1 if lens2 is None else lens2
         compute_device = torch.device(
             device
             if device is not None
             else ("cuda" if torch.cuda.is_available() else "cpu")
         )
 
-        lens1 = Jlens(logger)
-        lens1.load_lens(path=lens_path1)
-        lens2 = lens1 if lens_path2 is None else Jlens(logger)
-        if lens_path2 is not None:
-            lens2.load_lens(path=lens_path2)
-
-        assert lens1.lens is not None
-        assert lens2.lens is not None
+        if lens1.lens is None or lens2.lens is None:
+            raise ValueError("Both JLens instances must contain a loaded lens.")
         layers1 = lens1.lens.source_layers
         layers2 = lens2.lens.source_layers
-        jacobians1 = {
-            layer: lens1.lens.jacobians[layer].to(
-                device=compute_device, dtype=torch.float32
+        if readout_weights is not None:
+            heatmap, _ = MathTools.j_vector_similarities(
+                l1=lens1.lens.jacobians,
+                l2=lens2.lens.jacobians,
+                d1=layers1,
+                d2=layers2,
+                output_weights=readout_weights[0],
+                norm_weight=readout_weights[1],
+                device=compute_device,
             )
-            for layer in layers1
-        }
-        if lens1 is lens2:
-            jacobians2 = jacobians1
         else:
-            jacobians2 = {
-                layer: lens2.lens.jacobians[layer].to(
+            jacobians1 = {
+                layer: lens1.lens.jacobians[layer].to(
                     device=compute_device, dtype=torch.float32
                 )
-                for layer in layers2
+                for layer in layers1
             }
-
-        heatmap = MathTools.sim_for_sets(
-            l1=jacobians1,
-            l2=jacobians2,
-            d1=layers1,
-            d2=layers2,
-            func=MathTools.cos_similarity,
-        )
+            if lens1 is lens2:
+                jacobians2 = jacobians1
+            else:
+                jacobians2 = {
+                    layer: lens2.lens.jacobians[layer].to(
+                        device=compute_device, dtype=torch.float32
+                    )
+                    for layer in layers2
+                }
+            heatmap = MathTools.sim_for_sets(
+                l1=jacobians1,
+                l2=jacobians2,
+                d1=layers1,
+                d2=layers2,
+                func=MathTools.cos_similarity,
+            )
         logger.info("Computed cosine heatmap on %s", compute_device)
+        output_name = run_name or "heatmap"
+        if readout_weights is not None:
+            output_name += "_j_vectors"
+            if readout_weights[1] is None:
+                output_name += "_no_norm_scaling"
         MathTools.draw_heatmap(
             data=heatmap,
-            png_path=os.path.join(heatmap_path, f"{run_name or 'heatmap'}_cosine"),
+            png_path=os.path.join(heatmap_path, f"{output_name}_cosine"),
             x_labels=layers2,
             y_labels=layers1,
-            title="JLens Jacobian cosine similarity",
+            title=(
+                "JLens J-vector cosine similarity"
+                if readout_weights is not None
+                else "JLens Jacobian cosine similarity"
+            ),
         )
         logger.info("Saved JLens cosine heatmap to %s", heatmap_path)
         return heatmap
@@ -500,16 +561,15 @@ class Experiments:
         logger,
         run_name: str,
         output_dir: str,
-        lens_path: str,
+        lens: Jlens,
         top_k: int,
         device: str = "cpu",
     ) -> tuple[torch.Tensor, torch.Tensor, list[int], list[str]]:
         """Save per-layer sval spectra and adjacent-layer subspace heatmaps."""
 
         output_dir = os.path.join(output_dir, "SVD_analysis")
-        lens = Jlens(logger)
-        lens.load_lens(path=lens_path)
-        assert lens.lens is not None
+        if lens.lens is None:
+            raise ValueError("JLens instance must contain a loaded lens.")
 
         spectra, similarities, layers, layer_pairs = MatrixTools.draw_svd_heatmaps(
             jacobians=lens.lens.jacobians,
@@ -538,8 +598,12 @@ class Experiments:
         """
         # Validate inputs
         MatrixTools._validate_sval_threshold(sval_threshold)
-        matrix1 = MatrixTools._validate_jacobian(jacobian1, device=device)
-        matrix2 = MatrixTools._validate_jacobian(jacobian2, device=device)
+        matrix1 = jacobian1.detach().to(device=device, dtype=torch.float32)
+        matrix2 = jacobian2.detach().to(device=device, dtype=torch.float32)
+        if matrix1.ndim != 2 or matrix2.ndim != 2:
+            raise ValueError("Comparison matrices must be two-dimensional.")
+        if not torch.isfinite(matrix1).all() or not torch.isfinite(matrix2).all():
+            raise ValueError("Comparison matrices must contain only finite values.")
         if matrix1.shape != matrix2.shape:
             raise ValueError(
                 "Jacobians must have matching shapes, got "
@@ -622,8 +686,13 @@ class Experiments:
         svd_top_k: int = 8,
         device: str | torch.device | None = None,
         svd_device: str | torch.device = "cpu",
+        readout_weights: tuple[Tensor, Tensor | None] | None = None,
+        compute_svd: bool = True,
     ) -> dict[str, object]:
-        """Compute single-lens cosine, CKA, and singular-value analyses."""
+        """Compute similarity analyses and optionally Jacobian SVD.
+
+        SVD result keys are omitted when ``compute_svd`` is false.
+        """
         if not layers:
             raise ValueError("Cannot analyze a JLens with no source layers.")
         if len(set(layers)) != len(layers) or any(
@@ -636,114 +705,248 @@ class Experiments:
             if device is not None
             else ("cuda" if torch.cuda.is_available() else "cpu")
         )
-        cosine_jacobians = {
-            layer: jacobians[layer].to(device=compute_device, dtype=torch.float32)
-            for layer in layers
-        }
-        cosine_heatmap = MathTools.sim_for_sets(
-            l1=cosine_jacobians,
-            l2=cosine_jacobians,
-            d1=layers,
-            d2=layers,
-            func=MathTools.cos_similarity,
-        )
-        cka_heatmap = MathTools.cka_similarity(
-            l1=jacobians,
-            l2=jacobians,
-            d1=layers,
-            d2=layers,
-            device=device,
-        )
-        spectra, adjacent_cosines, svd_layers, layer_pairs = (
-            MatrixTools.analyze_layer_svd(
-                jacobians,
-                top_k=svd_top_k,
-                device=svd_device,
+        if readout_weights is None:
+            cosine_jacobians = {
+                layer: jacobians[layer].to(
+                    device=compute_device, dtype=torch.float32
+                )
+                for layer in layers
+            }
+            cosine_heatmap = MathTools.sim_for_sets(
+                l1=cosine_jacobians,
+                l2=cosine_jacobians,
+                d1=layers,
+                d2=layers,
+                func=MathTools.cos_similarity,
             )
-        )
+            cka_heatmap = MathTools.cka_similarity(
+                l1=jacobians,
+                l2=jacobians,
+                d1=layers,
+                d2=layers,
+                device=device,
+            )
+        else:
+            cosine_heatmap, cka_heatmap = MathTools.j_vector_similarities(
+                l1=jacobians,
+                l2=jacobians,
+                d1=layers,
+                d2=layers,
+                output_weights=readout_weights[0],
+                norm_weight=readout_weights[1],
+                device=compute_device,
+            )
         logger.info(
-            "Computed single-lens cosine, CKA, and SVD analysis for layers %s",
+            "Computed single-lens %s cosine and CKA analysis for layers %s",
+            "J-vector" if readout_weights is not None else "Jacobian",
             layers,
         )
-        return {
+        result: dict[str, object] = {
             "layers": layers,
             "cosine_heatmap": cosine_heatmap,
             "cka_heatmap": cka_heatmap,
-            "svd_spectra": spectra,
-            "svd_adjacent_cosines": adjacent_cosines,
-            "svd_layers": svd_layers,
-            "svd_layer_pairs": layer_pairs,
         }
+        if compute_svd:
+            spectra, adjacent_cosines, svd_layers, layer_pairs = (
+                MatrixTools.analyze_layer_svd(
+                    jacobians,
+                    top_k=svd_top_k,
+                    device=svd_device,
+                )
+            )
+            result.update({
+                "svd_spectra": spectra,
+                "svd_adjacent_cosines": adjacent_cosines,
+                "svd_layers": svd_layers,
+                "svd_layer_pairs": layer_pairs,
+            })
+            logger.info("Computed Jacobian SVD analysis for layers %s", layers)
+        return result
 
     @staticmethod
     def passk_Jlens(
         logger,
         model: Model,
         run_name: str,
-        lens_path: str,
         prompts_path: str,
         data_root: str,
         top_k: int,
         k_values: list[int],
+        do_batch: bool = False,
+        lens: list[Jlens] | None = None,
         layer: int | None = None,
+        target: str = "transcript",
     ) -> dict[str, object]:
         """Run JLens and LogitLens pass@k evaluation for all prompts.
 
+        In batch mode, evaluate each loaded JLens against the same prompts and
+        return reports keyed by lens index.
         Applies both lenses once per prompt, then reports the first transcript
         token's best rank across positions/layers and independently at each layer.
         """
-        if top_k < 1: raise ValueError("top_k must be at least 1")
-        # To match the original paper,
-        # this is expected to be a geometric or pseudo-geometric sequence.
+        if do_batch:
+            lenses = lens or []
+        else:
+            if lens is not None:
+                raise ValueError("Pass lens only when do_batch=True.")
+            if not isinstance(model.lens, Jlens):
+                raise ValueError("Load or bind a JLens on the model before evaluation.")
+            lenses = [model.lens]
+
+        result = Experiments._passk_Jlens_batch(
+            logger=logger,
+            model=model,
+            run_name=run_name,
+            prompts_path=prompts_path,
+            data_root=data_root,
+            top_k=top_k,
+            k_values=k_values,
+            lenses=lenses,
+            layer=layer,
+            target=target,
+        )
+        if do_batch:
+            return result
+
+        reports = result.get("lenses")
+        logit_report = result.get("logit_lens")
+        rows_by_lens = result.get("prediction_rows")
+        if not isinstance(reports, dict) or not isinstance(rows_by_lens, dict):
+            raise RuntimeError("Pass@k batch evaluation returned invalid results.")
+        lens_report = reports.get("0")
+        prediction_rows = rows_by_lens.get("0")
+        if not isinstance(lens_report, dict) or not isinstance(logit_report, dict):
+            raise RuntimeError("Pass@k batch evaluation returned invalid reports.")
+        if not isinstance(prediction_rows, list):
+            raise RuntimeError("Pass@k batch evaluation returned invalid prediction rows.")
+        lens_by_layer = lens_report.pop("by_layer")
+        logit_by_layer = logit_report.pop("by_layer")
+        return {
+            "k_values": result["k_values"],
+            "auc_x_axis": result["auc_x_axis"],
+            "layer": result["layer"],
+            "target": result["target"],
+            "position_policy": result["position_policy"],
+            "layer_policy": result["layer_policy"],
+            **lens_report,
+            "logit_lens": logit_report,
+            "by_layer": {
+                "jlens": lens_by_layer,
+                "logit_lens": logit_by_layer,
+            },
+            "prediction_rows": prediction_rows,
+        }
+
+    @staticmethod
+    def _passk_Jlens_batch(
+        *,
+        logger,
+        model: Model,
+        run_name: str,
+        prompts_path: str,
+        data_root: str,
+        top_k: int,
+        k_values: list[int],
+        lenses: list[Jlens],
+        layer: int | None,
+        target: str,
+    ) -> dict[str, object]:
+        """Evaluate several lenses using one model forward pass per prompt."""
+        if not lenses:
+            raise ValueError("Batch evaluation requires at least one loaded JLens.")
+        if top_k < 1:
+            raise ValueError("top_k must be at least 1")
+        if not k_values or any(not isinstance(k, int) or k <= 0 for k in k_values):
+            raise ValueError("k_values must contain positive integers")
+        if target != "transcript" and not (
+            target.startswith("label.") and target[len("label."):].strip()
+        ):
+            raise ValueError(
+                "Pass@k target must be 'transcript' or 'label.<field>'."
+            )
+        jacobian_lenses = []
+        for index, item in enumerate(lenses):
+            if not isinstance(item, Jlens) or item.lens is None:
+                raise ValueError(
+                    f"Batch item {index} must be a loaded JLens instance."
+                )
+            jacobian_lenses.append(item.lens)
+
         sorted_k_values = sorted(set(k_values))
         json_lines = Parser.load_jsonl_lines(prompts_path)
-        # Load lens
-        model.load_Jlens(lens_path=lens_path)
-        passk_results = {
-            lens_name: passk_cache(
-                prompt_cnt=0,
-                best_token_pos=[],
-                best_k_values=[],
-                best_probability=[],
-                best_layers=[],
+        adapter = model.load_model()
+        adapter.load_data(data_root)
+        for index, jacobian_lens in enumerate(jacobian_lenses):
+            if jacobian_lens.d_model != adapter.d_model:
+                raise ValueError(
+                    f"JLens at index {index} has d_model={jacobian_lens.d_model}, "
+                    f"but the model has d_model={adapter.d_model}."
+                )
+            if not jacobian_lens.source_layers:
+                raise ValueError(f"JLens at index {index} has no source layers.")
+            if layer is not None and layer not in jacobian_lens.source_layers:
+                raise ValueError(
+                    f"Requested layer {layer} is not present in JLens at index {index}."
+                )
+            invalid_layers = sorted(
+                set(jacobian_lens.source_layers)
+                - set(range(adapter.n_layers - 1))
             )
-            for lens_name in ("jlens", "logit_lens")
-        }
-        prediction_rows: list[dict[str, object]] = []
-        passk_summaries: dict[
-            str, dict[str, float | int | dict[int, float] | list[float]]
-        ] = {}
-        per_layer_caches: dict[str, dict[int, passk_cache]] | None = None
-        per_layer_summaries: dict[
-            str, dict[int, dict[str, float | int | dict[int, float] | list[float]]]
-        ] = {}
-        # Main loop(loop through prompts)
-        for json_line in json_lines:
-            model.apply_lens(
-                json_line=json_line,
-                data_root=data_root,
-                top_k=top_k,
-                use_Jlens=True,
-                run_name=run_name,
-                layers_available=[layer] if layer is not None else None,
-            )
-            prediction_rows.extend(model.lens_cache.to_rows(top_k=top_k))
-            # Parse JSON line
-            sample = Parser.parse_json_line(json_line)
-            transcript = sample.transcript
-            if transcript is None:
-                logger.warning(f"Sample {sample.sample_id} has no transcript to evaluate")
-                continue
-            transcript = transcript.strip()
-            # Remove leading (a) (b) .etc in case it's part of multiple-choice formatting
-            if transcript.startswith("(") and ")" in transcript:
-                transcript = transcript.split(")", 1)[1].strip()
+            if invalid_layers:
+                raise ValueError(
+                    f"JLens at index {index} has invalid source layers "
+                    f"{invalid_layers} for this model."
+                )
 
+        lens_layers = [
+            jacobian_lens.source_layers if layer is None else [layer]
+            for jacobian_lens in jacobian_lenses
+        ]
+        union_layers = sorted({item for layers in lens_layers for item in layers})
+        final_layer = adapter.n_layers - 1
+        logit_layers = list(range(adapter.n_layers)) if layer is None else [layer]
+        logit_result_layers = (
+            union_layers if layer is None else [layer]
+        )
+        lens_caches = [passk_cache() for _ in lenses]
+        lens_summaries: list[
+            dict[str, float | int | dict[int, float] | list[float]]
+        ] = [{} for _ in lenses]
+        lens_layer_caches = [
+            {layer_idx: passk_cache() for layer_idx in current_layers}
+            for current_layers in lens_layers
+        ]
+        lens_layer_summaries: list[
+            dict[int, dict[str, float | int | dict[int, float] | list[float]]]
+        ] = [{} for _ in lenses]
+        logit_cache = passk_cache()
+        logit_summary: dict[
+            str, float | int | dict[int, float] | list[float]
+        ] = {}
+        logit_layer_caches = {
+            layer_idx: passk_cache() for layer_idx in logit_result_layers
+        }
+        logit_layer_summaries: dict[
+            int, dict[str, float | int | dict[int, float] | list[float]]
+        ] = {}
+        rows_by_lens: dict[str, list[dict[str, object]]] = {
+            str(index): [] for index in range(len(lenses))
+        }
+
+        for json_line in json_lines:
+            sample = Parser.parse_json_line(json_line)
+            target_text = Experiments._passk_target_text(
+                sample,
+                target,
+                logger,
+            )
+            if target_text is None:
+                continue
             processor = model.processor
-            assert processor is not None, "The configured model adapter has no processor."
-            
+            if processor is None:
+                raise RuntimeError("The configured model adapter has no processor.")
             target_ids = processor.tokenizer(
-                transcript,
+                target_text,
                 add_special_tokens=False,
                 return_tensors="pt",
             )["input_ids"]
@@ -752,124 +955,143 @@ class Experiments:
                     f"Transcript for sample {sample.sample_id} produced no tokens"
                 )
             ans_token = int(target_ids[0, 0].item())
-            for lens_name, lens_data in (
-                ("jlens", model.lens_cache.jlens_data),
-                ("logit_lens", model.lens_cache.logit_lens_data),
-            ):
-                if lens_data is None:
-                    raise RuntimeError(
-                        f"{lens_name} output was not cached for sample {sample.sample_id}"
-                    )
-                passk_summaries[lens_name] = Experiments.eval_passk(
+            input_ids = adapter.encode(json_line, max_length=300)
+
+            with torch.no_grad(), ActivationRecorder(
+                adapter.layers, at=[*union_layers, final_layer]
+            ) as recorder:
+                adapter.forward(input_ids)
+            activations = {
+                layer_idx: recorder.activations[layer_idx].detach()
+                for layer_idx in {*union_layers, final_layer}
+            }
+
+            def residual_at(layer_idx: int) -> Tensor:
+                return activations[layer_idx][0].float()
+
+            model_logits = adapter.unembed(residual_at(final_layer)).float().cpu()
+            logit_data = (
+                {
+                    layer_idx: adapter.unembed(
+                        residual_at(layer_idx)
+                    ).float().cpu()
+                    for layer_idx in logit_layers
+                },
+                model_logits,
+                input_ids,
+            )
+            model.lens_cache.put("logit_lens", logit_data)
+            logit_summary = Experiments.eval_passk(
+                logger=logger,
+                run_name=f"{run_name} logit_lens",
+                lens_data=logit_data,
+                passk_cache=logit_cache,
+                ans_token=ans_token,
+                k_values=sorted_k_values,
+                layer=layer,
+            )
+            for layer_idx in logit_result_layers:
+                logit_layer_summaries[layer_idx] = Experiments.eval_passk(
                     logger=logger,
-                    run_name=f"{run_name} {lens_name}",
+                    run_name=f"{run_name} logit_lens layer {layer_idx}",
+                    lens_data=logit_data,
+                    passk_cache=logit_layer_caches[layer_idx],
+                    ans_token=ans_token,
+                    k_values=sorted_k_values,
+                    layer=layer_idx,
+                )
+
+            for index, jacobian_lens in enumerate(jacobian_lenses):
+                lens_data = (
+                    {
+                        layer_idx: adapter.unembed(
+                            jacobian_lens.transport(
+                                residual_at(layer_idx), layer_idx
+                            )
+                        ).float().cpu()
+                        for layer_idx in lens_layers[index]
+                    },
+                    model_logits,
+                    input_ids,
+                )
+                model.lens_cache.put("jlens", lens_data)
+                rows_by_lens[str(index)].extend(
+                    model.lens_cache.to_rows(top_k=top_k)
+                )
+                lens_summaries[index] = Experiments.eval_passk(
+                    logger=logger,
+                    run_name=f"{run_name} lens {index}",
                     lens_data=lens_data,
-                    passk_cache=passk_results[lens_name],
+                    passk_cache=lens_caches[index],
                     ans_token=ans_token,
                     k_values=sorted_k_values,
                     layer=layer,
                 )
-            jlens_data = model.lens_cache.jlens_data
-            logit_lens_data = model.lens_cache.logit_lens_data
-            if jlens_data is None or logit_lens_data is None:
-                raise RuntimeError(
-                    f"Both lens outputs are required for sample {sample.sample_id}"
-                )
-            available_layers = sorted(jlens_data[0])
-            # Logitlens will include the second to last layer, while Jlens will not.
-            logit_layers = sorted(logit_lens_data[0])[:-1]
-            
-            if available_layers != logit_layers:
-                raise ValueError(
-                    "JLens and LogitLens layer outputs do not match: "
-                    f"{available_layers!r} != {logit_layers!r}."
-                )
-            selected_layers = [layer] if layer is not None else available_layers
-            if per_layer_caches is None:
-                per_layer_caches = {
-                    lens_name: {
-                        layer_idx: passk_cache(
-                            prompt_cnt=0,
-                            best_token_pos=[],
-                            best_k_values=[],
-                            best_probability=[],
-                            best_layers=[],
-                        )
-                        for layer_idx in selected_layers
-                    }
-                    for lens_name in ("jlens", "logit_lens")
-                }
-                per_layer_summaries = {
-                    lens_name: {} for lens_name in ("jlens", "logit_lens")
-                }
-            elif any(
-                sorted(per_layer_caches[lens_name]) != selected_layers
-                for lens_name in ("jlens", "logit_lens")
-            ):
-                raise ValueError(
-                    "The available lens layers changed during pass@k evaluation."
-                )
-
-            for lens_name, lens_data in (
-                ("jlens", jlens_data),
-                ("logit_lens", logit_lens_data),
-            ):
-                for layer_idx in selected_layers:
-                    per_layer_summaries[lens_name][layer_idx] = (
+                for layer_idx in lens_layers[index]:
+                    lens_layer_summaries[index][layer_idx] = (
                         Experiments.eval_passk(
                             logger=logger,
-                            run_name=f"{run_name} {lens_name} layer {layer_idx}",
+                            run_name=f"{run_name} lens {index} layer {layer_idx}",
                             lens_data=lens_data,
-                            passk_cache=per_layer_caches[lens_name][layer_idx],
+                            passk_cache=lens_layer_caches[index][layer_idx],
                             ans_token=ans_token,
                             k_values=sorted_k_values,
                             layer=layer_idx,
                         )
                     )
 
-        if not passk_summaries:
+        if not json_lines or not all(lens_summaries):
             raise RuntimeError("Pass@k evaluation did not process any prompts")
 
-        def build_lens_report(lens_name: str) -> dict[str, object]:
-            cache = passk_results[lens_name]
+        def report(
+            cache: passk_cache,
+            summary: dict[str, float | int | dict[int, float] | list[float]],
+        ) -> dict[str, object]:
             return {
-                **passk_summaries[lens_name],
+                **summary,
                 "best_answer_ranks": cache.best_k_values,
                 "answer_probabilities": cache.best_probability,
                 "target_positions": cache.best_token_pos,
                 "best_layers": cache.best_layers,
             }
 
-        by_layer: dict[str, dict[str, dict[str, object]]] = {}
-        if per_layer_caches is not None:
-            for lens_name, layer_caches in per_layer_caches.items():
-                by_layer[lens_name] = {}
-                for layer_idx, cache in layer_caches.items():
-                    by_layer[lens_name][str(layer_idx)] = {
-                        **per_layer_summaries[lens_name][layer_idx],
-                        "best_answer_ranks": cache.best_k_values,
-                        "answer_probabilities": cache.best_probability,
-                        "target_positions": cache.best_token_pos,
-                        "best_layers": cache.best_layers,
-                    }
-
         return {
             "k_values": sorted_k_values,
             "auc_x_axis": "log(k)",
             "layer": layer,
+            "target": target,
             "position_policy": "best rank over prompt positions",
             "layer_policy": (
                 "selected layer only"
                 if layer is not None
                 else "all layers pooled for overall metrics; each layer scored independently in by_layer"
             ),
-            # Keep the original JLens report fields at top level for compatibility.
-            **build_lens_report("jlens"),
-            "logit_lens": build_lens_report("logit_lens"),
-            "by_layer": by_layer,
-            "prediction_rows": prediction_rows,
+            "lenses": {
+                str(index): {
+                    **report(lens_caches[index], lens_summaries[index]),
+                    "by_layer": {
+                        str(layer_idx): report(
+                            lens_layer_caches[index][layer_idx],
+                            lens_layer_summaries[index][layer_idx],
+                        )
+                        for layer_idx in lens_layers[index]
+                    },
+                }
+                for index in range(len(lenses))
+            },
+            "logit_lens": {
+                **report(logit_cache, logit_summary),
+                "by_layer": {
+                    str(layer_idx): report(
+                        logit_layer_caches[layer_idx],
+                        logit_layer_summaries[layer_idx],
+                    )
+                    for layer_idx in logit_result_layers
+                },
+            },
+            "prediction_rows": rows_by_lens,
         }
-    
+
     @staticmethod
     def eval_passk(
         logger,

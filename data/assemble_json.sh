@@ -1,24 +1,22 @@
 #!/usr/bin/env bash
 
-# SAKURA is reserved for testing and already contains user prompts.
+# Sample 300 records, balanced across FSD50K focus classes.
 # Keep the seed fixed for reproducibility; --override prevents duplicate
 # records from accumulating when this script is rerun.
-seed=42
-splits=(
-    "AnimalQA"
-    "EmotionQA"
-    "GenderQA"
-    "LanguageQA"
-)
-output=data/assembled/test_SAKURA
-data_root=data/datasets/SAKURA
+set -euo pipefail
 
-for split in "${splits[@]}"; do
-    python data/assemble_json.py \
-        --dataset $data_root/$split \
-        --dataset_name SAKURA_$split \
-        --seed $seed \
-        --count 100 \
-        --output $output/$split/ \
-        --override
-done
+PYTHON="${PYTHON:-python}"
+dataset=data/datasets/fsd50k_pilot
+output=data/assembled/train/fsd50k
+
+"$PYTHON" data/assemble_json.py \
+    --dataset "$dataset" \
+    --dataset_name FSD50K \
+    --seed 42 \
+    --count 300 \
+    --stratify-labels focus_class \
+    --output "$output" \
+    --override \
+    --prompt-file data/llama/environment_sound_prompt.txt
+
+cp "$0" "$output/assemble_json.sh"

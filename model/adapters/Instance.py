@@ -141,6 +141,12 @@ class Instance(LensModel):
     def get_unembedding_direction(self, token_id: int) -> Tensor:
         raise NotImplementedError("Subclasses must implement token directions for ablation.")
 
+    def get_unembedding_weights(self) -> tuple[Tensor, Tensor]:
+        """Return the output projection weights and final norm scale."""
+        raise NotImplementedError(
+            "Subclasses must expose output projection weights for J-vector analysis."
+        )
+
     def ablation_forward(
         self,
         input_ids: Tensor,
