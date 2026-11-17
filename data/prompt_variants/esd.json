@@ -1,0 +1,17 @@
+[
+  {"id": "p00_none", "group": "none", "text": ""},
+  {"id": "p01_lang_what", "group": "language", "text": "What language is being spoken in this audio?"},
+  {"id": "p02_lang_namerica", "group": "language", "text": "Is the language spoken in this audio a language commonly spoken in North America?"},
+  {"id": "p03_gender_male", "group": "gender", "text": "Is the speaker of this audio male?"},
+  {"id": "p04_gender_confidence", "group": "gender", "text": "Can you identify the speaker's gender with a high degree of confidence?"},
+  {"id": "p05_emo_tone", "group": "emotion", "text": "What is the speaker's tone in this audio?"},
+  {"id": "p06_emo_state", "group": "emotion", "text": "Can you identify the speaker's emotional state in this audio?"},
+  {"id": "p07_emo_excitement", "group": "emotion", "text": "Does the speaker exhibit any signs of excitement or enthusiasm?"},
+  {"id": "p08_attr_loudness", "group": "speech_attribute", "text": "Is the speaker's voice loud or soft?"},
+  {"id": "p09_attr_rate", "group": "speech_attribute", "text": "Is the speaker's speech rate fast or slow?"},
+  {"id": "p10_comp_main_idea", "group": "comprehension", "text": "What is the main idea of this audio?"},
+  {"id": "p11_comp_intent", "group": "comprehension", "text": "What is the speaker's intent in this audio?"},
+  {"id": "p12_comp_setting", "group": "comprehension", "text": "What is the setting or context in which the speaker is speaking?"},
+  {"id": "p13_offdomain_sound_type", "group": "off_domain", "text": "What type of sound is that?"},
+  {"id": "p14_offdomain_animal", "group": "off_domain", "text": "Can you identify the type of animal making that noise?"}
+]

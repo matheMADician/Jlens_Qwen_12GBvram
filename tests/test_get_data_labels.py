@@ -99,18 +99,13 @@ class GetDataLabelTests(unittest.TestCase):
 
         self.assertEqual(set(counts.values()), {2})
 
-    def test_joint_stratification_requires_divisible_target(self) -> None:
-        with self.assertRaisesRegex(ValueError, "must be divisible"):
-            stratified_sample_indices(
-                [
-                    ("calm", "en"),
-                    ("calm", "en"),
-                    ("angry", "en"),
-                    ("angry", "en"),
-                ],
-                target=3,
-                seed=42,
-            )
+    def test_joint_stratification_rounds_target_up_to_multiple_of_strata(self) -> None:
+        strata = [label for label in range(9) for _ in range(56)]
+
+        selected = stratified_sample_indices(strata, target=500, seed=42)
+
+        self.assertEqual(len(selected), 504)
+        self.assertEqual(set(Counter(strata[index] for index in selected).values()), {56})
 
 
 if __name__ == "__main__":

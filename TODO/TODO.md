@@ -1,12 +1,27 @@
 ## 程式碼庫工作
 
+### 正要進行
+1. 做 esd_300 和 fsd50k_300 的交叉比對(running)
+   - esd_300, fsd50k_300 在 esd 上的 pass@k
+   - esd_300, fsd50k_300 在 fsd50 上的 pass@k
+
+2. 做 esd_300 和 fsd50k_300 在各checkpoint上的 pass@k
+   - 訓練時忘記把 milestones 關掉了，但訓練都訓練了，就拿來用吧
+
+3. 做腔調分析，dataset選一個
+   - https://huggingface.co/datasets/changelinglab/speechaccentarchive-pr/viewer/default/test?p=1
+   - https://huggingface.co/datasets/chikingsley/l2-arctic-release-v5.0
+
+![alt text](image.png)
+
 ### 增加資料集
 加入以下資料集:
 
    https://huggingface.co/datasets/mozilla-foundation/common_voice_13_0/tree/main
    https://huggingface.co/datasets/facebook/voxpopuli
    https://huggingface.co/datasets/bernardocecchetto/
-   https://huggingface.co/datasets/jspaulsen/esd
+   https://huggingface.co/datasets/jspaulsen/esd (DONE)
+   https://zenodo.org/records/4060432 (DONE)
    https://huggingface.co/datasets/renumics/emodb
 
 - 先做:
@@ -32,11 +47,13 @@
 對單一prompt的每個TOKEN位置和layer都做Jlens預測。然後用那個prompt對應的label在各處的預測機率畫成熱力圖。完成後觀察它的特性，並決定實驗有甚麼可以修改的。
 
 ### 雜項
+0. (非常重要!!!!) 抽樣訓練資料時，要建一個表紀錄用過的sample id，並在assemble_json.py加入一個輸入，讓他在抽樣val時可以根據它避開抽樣過的。
+
 1. 整合曹祖恩的工作(他push到github，但本地沒有事先上傳)
 
 2. 擴充 `create-model-settings`，讓它涵蓋更多設定。
 
-3. 整理程式碼庫。
+3. 整理程式碼庫，將與hf model完全無關的邏輯移到對應的tools/*.py中，不要把 main.py 塞滿
 
 4. 整理日誌輸出，並加入進度條。
 

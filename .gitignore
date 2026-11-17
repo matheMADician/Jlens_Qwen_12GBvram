@@ -40,3 +40,9 @@ test_gpu.sh
 
 # Copilot files
 /.github/copilot-instructions.md
+
+# Memo
+MEMO.md
+
+# Claude setting file
+CLAUDE.md

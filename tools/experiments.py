@@ -1,12 +1,13 @@
 import os, math, json, random, statistics
 from dataclasses import dataclass, field
+from typing import TypedDict
 
 import torch
 from torch import Tensor, linalg
 
 from audio_jlens.jlens import Jlens
 from jacobian_lens.jlens.hooks import ActivationRecorder
-from json_parser import Parser
+from json_parser import ParsedSample, Parser
 from tools.math_tools import MathTools
 from tools.matrix_tools import MatrixTools, LayerSVDMetrics
 from model.model import Model, SWAP_DIRECTION_SOURCES
@@ -23,6 +24,38 @@ class passk_cache:
     best_probability: list[float] = field(default_factory=list)
     best_layers: list[int] = field(default_factory=list)
     layer: int | None = None
+
+
+PasskSummary = dict[str, float | int | dict[int, float] | list[float]]
+
+
+class SwapRow(TypedDict):
+    sample_id: str
+    label_match: bool
+    source_text: str
+    target_word: str
+    target_text: str
+    band: str
+    direction_source: str
+    position_policy: str
+    swapped_top_text: str
+    target_rank: int
+    source_rank: int
+    logit_gap_shift: float
+    direction_cosine: float
+    excluded_high_cosine: bool
+
+
+@dataclass
+class _PasskTargetState:
+    lens_caches: list[passk_cache]
+    lens_summaries: list[PasskSummary]
+    lens_layer_caches: list[dict[int, passk_cache]]
+    lens_layer_summaries: list[dict[int, PasskSummary]]
+    logit_cache: passk_cache
+    logit_summary: PasskSummary
+    logit_layer_caches: dict[int, passk_cache]
+    logit_layer_summaries: dict[int, PasskSummary]
 
 #TODO write docstring for this class
 @dataclass
@@ -211,12 +244,16 @@ class Experiments:
         model.load_Jlens(lens_path=lens_path)
         instance = model.load_model()
         tokenizer = instance.tokenizer
+        if tokenizer is None:
+            raise RuntimeError("The configured model adapter has no tokenizer.")
+        if not isinstance(model.lens, Jlens) or model.lens.lens is None:
+            raise RuntimeError("The configured JLens checkpoint did not load.")
         bands = Experiments.swap_layer_bands(
             layer_bands_percent, instance.n_layers, model.lens.lens.source_layers
         )
         instance.load_data(data_root=data_root)
 
-        rows: list[dict[str, object]] = []
+        rows: list[SwapRow] = []
         skipped: list[dict[str, object]] = []
         for prompt_index, raw_line in enumerate(json_lines):
             json_line = Experiments.swap_prompt_line(raw_line, instruction)
@@ -314,7 +351,7 @@ class Experiments:
         direction_source: str,
         position_policy: str,
         max_direction_cosine: float,
-    ) -> dict[str, object]:
+    ) -> SwapRow:
         """Score one swap from its next-token logits."""
         baseline = result.baseline_logits[0]
         swapped = result.swapped_logits[0]
@@ -343,9 +380,9 @@ class Experiments:
         }
 
     @staticmethod
-    def _summarize_swap_rows(rows: list[dict[str, object]]) -> list[dict[str, object]]:
+    def _summarize_swap_rows(rows: list[SwapRow]) -> list[dict[str, object]]:
         """Aggregate swaps by direction source, layer band, and position policy."""
-        groups: dict[tuple[str, str, str], list[dict[str, object]]] = {}
+        groups: dict[tuple[str, str, str], list[SwapRow]] = {}
         for row in rows:
             key = (row["direction_source"], row["band"], row["position_policy"])
             groups.setdefault(key, []).append(row)
@@ -375,25 +412,8 @@ class Experiments:
             })
         return summary
 
-
-    def _passk_target_text(sample, target: str, logger) -> str | None:
-        if target == "transcript":
-            target_text = sample.transcript
-            if target_text is None:
-                logger.warning(
-                    "Sample %s has no transcript to evaluate", sample.sample_id
-                )
-                return None
-            target_text = target_text.strip()
-            if target_text.startswith("(") and ")" in target_text:
-                target_text = target_text.split(")", 1)[1].strip()
-            return target_text
-
-        if not target.startswith("label.") or not target[len("label."):].strip():
-            raise ValueError(
-                "Pass@k target must be 'transcript' or 'label.<field>'."
-            )
-        label_key = target[len("label."):]
+    @staticmethod
+    def _passk_target_text(sample: ParsedSample, label_key: str) -> str:
         labels = sample.label
         if not isinstance(labels, dict) or label_key not in labels:
             raise ValueError(
@@ -772,17 +792,17 @@ class Experiments:
         data_root: str,
         top_k: int,
         k_values: list[int],
+        label_keys: list[str],
         do_batch: bool = False,
         lens: list[Jlens] | None = None,
         layer: int | None = None,
-        target: str = "transcript",
     ) -> dict[str, object]:
         """Run JLens and LogitLens pass@k evaluation for all prompts.
 
         In batch mode, evaluate each loaded JLens against the same prompts and
         return reports keyed by lens index.
-        Applies both lenses once per prompt, then reports the first transcript
-        token's best rank across positions/layers and independently at each layer.
+        Applies both lenses once per prompt and scores the first token of each
+        selected scalar label across positions/layers.
         """
         if do_batch:
             lenses = lens or []
@@ -803,37 +823,19 @@ class Experiments:
             k_values=k_values,
             lenses=lenses,
             layer=layer,
-            target=target,
+            label_keys=label_keys,
         )
         if do_batch:
             return result
 
-        reports = result.get("lenses")
-        logit_report = result.get("logit_lens")
         rows_by_lens = result.get("prediction_rows")
-        if not isinstance(reports, dict) or not isinstance(rows_by_lens, dict):
+        if not isinstance(rows_by_lens, dict):
             raise RuntimeError("Pass@k batch evaluation returned invalid results.")
-        lens_report = reports.get("0")
         prediction_rows = rows_by_lens.get("0")
-        if not isinstance(lens_report, dict) or not isinstance(logit_report, dict):
-            raise RuntimeError("Pass@k batch evaluation returned invalid reports.")
         if not isinstance(prediction_rows, list):
             raise RuntimeError("Pass@k batch evaluation returned invalid prediction rows.")
-        lens_by_layer = lens_report.pop("by_layer")
-        logit_by_layer = logit_report.pop("by_layer")
         return {
-            "k_values": result["k_values"],
-            "auc_x_axis": result["auc_x_axis"],
-            "layer": result["layer"],
-            "target": result["target"],
-            "position_policy": result["position_policy"],
-            "layer_policy": result["layer_policy"],
-            **lens_report,
-            "logit_lens": logit_report,
-            "by_layer": {
-                "jlens": lens_by_layer,
-                "logit_lens": logit_by_layer,
-            },
+            "label_results": result["label_results"],
             "prediction_rows": prediction_rows,
         }
 
@@ -849,7 +851,7 @@ class Experiments:
         k_values: list[int],
         lenses: list[Jlens],
         layer: int | None,
-        target: str,
+        label_keys: list[str],
     ) -> dict[str, object]:
         """Evaluate several lenses using one model forward pass per prompt."""
         if not lenses:
@@ -858,12 +860,12 @@ class Experiments:
             raise ValueError("top_k must be at least 1")
         if not k_values or any(not isinstance(k, int) or k <= 0 for k in k_values):
             raise ValueError("k_values must contain positive integers")
-        if target != "transcript" and not (
-            target.startswith("label.") and target[len("label."):].strip()
+        if (
+            not label_keys
+            or any(not isinstance(key, str) or not key.strip() for key in label_keys)
+            or len(set(label_keys)) != len(label_keys)
         ):
-            raise ValueError(
-                "Pass@k target must be 'transcript' or 'label.<field>'."
-            )
+            raise ValueError("Pass@k requires distinct, non-empty label keys.")
         jacobian_lenses = []
         for index, item in enumerate(lenses):
             if not isinstance(item, Jlens) or item.lens is None:
@@ -908,53 +910,47 @@ class Experiments:
         logit_result_layers = (
             union_layers if layer is None else [layer]
         )
-        lens_caches = [passk_cache() for _ in lenses]
-        lens_summaries: list[
-            dict[str, float | int | dict[int, float] | list[float]]
-        ] = [{} for _ in lenses]
-        lens_layer_caches = [
-            {layer_idx: passk_cache() for layer_idx in current_layers}
-            for current_layers in lens_layers
-        ]
-        lens_layer_summaries: list[
-            dict[int, dict[str, float | int | dict[int, float] | list[float]]]
-        ] = [{} for _ in lenses]
-        logit_cache = passk_cache()
-        logit_summary: dict[
-            str, float | int | dict[int, float] | list[float]
-        ] = {}
-        logit_layer_caches = {
-            layer_idx: passk_cache() for layer_idx in logit_result_layers
+        states = {
+            label_key: _PasskTargetState(
+                lens_caches=[passk_cache() for _ in lenses],
+                lens_summaries=[{} for _ in lenses],
+                lens_layer_caches=[
+                    {layer_idx: passk_cache() for layer_idx in current_layers}
+                    for current_layers in lens_layers
+                ],
+                lens_layer_summaries=[{} for _ in lenses],
+                logit_cache=passk_cache(),
+                logit_summary={},
+                logit_layer_caches={
+                    layer_idx: passk_cache() for layer_idx in logit_result_layers
+                },
+                logit_layer_summaries={},
+            )
+            for label_key in label_keys
         }
-        logit_layer_summaries: dict[
-            int, dict[str, float | int | dict[int, float] | list[float]]
-        ] = {}
         rows_by_lens: dict[str, list[dict[str, object]]] = {
             str(index): [] for index in range(len(lenses))
         }
 
         for json_line in json_lines:
             sample = Parser.parse_json_line(json_line)
-            target_text = Experiments._passk_target_text(
-                sample,
-                target,
-                logger,
-            )
-            if target_text is None:
-                continue
+            answer_tokens: dict[str, int] = {}
             processor = model.processor
             if processor is None:
                 raise RuntimeError("The configured model adapter has no processor.")
-            target_ids = processor.tokenizer(
-                target_text,
-                add_special_tokens=False,
-                return_tensors="pt",
-            )["input_ids"]
-            if target_ids.numel() == 0:
-                raise ValueError(
-                    f"Transcript for sample {sample.sample_id} produced no tokens"
-                )
-            ans_token = int(target_ids[0, 0].item())
+            for label_key in label_keys:
+                target_text = Experiments._passk_target_text(sample, label_key)
+                target_ids = processor.tokenizer(
+                    target_text,
+                    add_special_tokens=False,
+                    return_tensors="pt",
+                )["input_ids"]
+                if target_ids.numel() == 0:
+                    raise ValueError(
+                        f"Label {label_key!r} for sample {sample.sample_id} "
+                        "produced no tokens."
+                    )
+                answer_tokens[label_key] = int(target_ids[0, 0].item())
             input_ids = adapter.encode(json_line, max_length=300)
 
             with torch.no_grad(), ActivationRecorder(
@@ -981,26 +977,29 @@ class Experiments:
                 input_ids,
             )
             model.lens_cache.put("logit_lens", logit_data)
-            logit_summary = Experiments.eval_passk(
-                logger=logger,
-                run_name=f"{run_name} logit_lens",
-                lens_data=logit_data,
-                passk_cache=logit_cache,
-                ans_token=ans_token,
-                k_values=sorted_k_values,
-                layer=layer,
-            )
-            for layer_idx in logit_result_layers:
-                logit_layer_summaries[layer_idx] = Experiments.eval_passk(
+            for label_key, state in states.items():
+                ans_token = answer_tokens[label_key]
+                state.logit_summary = Experiments.eval_passk(
                     logger=logger,
-                    run_name=f"{run_name} logit_lens layer {layer_idx}",
+                    run_name=f"{run_name} {label_key} logit_lens",
                     lens_data=logit_data,
-                    passk_cache=logit_layer_caches[layer_idx],
+                    passk_cache=state.logit_cache,
                     ans_token=ans_token,
                     k_values=sorted_k_values,
-                    layer=layer_idx,
+                    layer=layer,
                 )
-
+                for layer_idx in logit_result_layers:
+                    state.logit_layer_summaries[layer_idx] = Experiments.eval_passk(
+                        logger=logger,
+                        run_name=(
+                            f"{run_name} {label_key} logit_lens layer {layer_idx}"
+                        ),
+                        lens_data=logit_data,
+                        passk_cache=state.logit_layer_caches[layer_idx],
+                        ans_token=ans_token,
+                        k_values=sorted_k_values,
+                        layer=layer_idx,
+                    )
             for index, jacobian_lens in enumerate(jacobian_lenses):
                 lens_data = (
                     {
@@ -1018,29 +1017,36 @@ class Experiments:
                 rows_by_lens[str(index)].extend(
                     model.lens_cache.to_rows(top_k=top_k)
                 )
-                lens_summaries[index] = Experiments.eval_passk(
-                    logger=logger,
-                    run_name=f"{run_name} lens {index}",
-                    lens_data=lens_data,
-                    passk_cache=lens_caches[index],
-                    ans_token=ans_token,
-                    k_values=sorted_k_values,
-                    layer=layer,
-                )
-                for layer_idx in lens_layers[index]:
-                    lens_layer_summaries[index][layer_idx] = (
-                        Experiments.eval_passk(
-                            logger=logger,
-                            run_name=f"{run_name} lens {index} layer {layer_idx}",
-                            lens_data=lens_data,
-                            passk_cache=lens_layer_caches[index][layer_idx],
-                            ans_token=ans_token,
-                            k_values=sorted_k_values,
-                            layer=layer_idx,
-                        )
+                for label_key, state in states.items():
+                    ans_token = answer_tokens[label_key]
+                    state.lens_summaries[index] = Experiments.eval_passk(
+                        logger=logger,
+                        run_name=f"{run_name} {label_key} lens {index}",
+                        lens_data=lens_data,
+                        passk_cache=state.lens_caches[index],
+                        ans_token=ans_token,
+                        k_values=sorted_k_values,
+                        layer=layer,
                     )
+                    for layer_idx in lens_layers[index]:
+                        state.lens_layer_summaries[index][layer_idx] = (
+                            Experiments.eval_passk(
+                                logger=logger,
+                                run_name=(
+                                    f"{run_name} {label_key} lens {index} "
+                                    f"layer {layer_idx}"
+                                ),
+                                lens_data=lens_data,
+                                passk_cache=state.lens_layer_caches[index][layer_idx],
+                                ans_token=ans_token,
+                                k_values=sorted_k_values,
+                                layer=layer_idx,
+                            )
+                        )
 
-        if not json_lines or not all(lens_summaries):
+        if not json_lines or any(
+            not all(state.lens_summaries) for state in states.values()
+        ):
             raise RuntimeError("Pass@k evaluation did not process any prompts")
 
         def report(
@@ -1056,38 +1062,47 @@ class Experiments:
             }
 
         return {
-            "k_values": sorted_k_values,
-            "auc_x_axis": "log(k)",
-            "layer": layer,
-            "target": target,
-            "position_policy": "best rank over prompt positions",
-            "layer_policy": (
-                "selected layer only"
-                if layer is not None
-                else "all layers pooled for overall metrics; each layer scored independently in by_layer"
-            ),
-            "lenses": {
-                str(index): {
-                    **report(lens_caches[index], lens_summaries[index]),
-                    "by_layer": {
-                        str(layer_idx): report(
-                            lens_layer_caches[index][layer_idx],
-                            lens_layer_summaries[index][layer_idx],
-                        )
-                        for layer_idx in lens_layers[index]
+            "label_results": {
+                label_key: {
+                    "k_values": sorted_k_values,
+                    "auc_x_axis": "log(k)",
+                    "layer": layer,
+                    "label": label_key,
+                    "position_policy": "best rank over prompt positions",
+                    "layer_policy": (
+                        "selected layer only"
+                        if layer is not None
+                        else "all layers pooled for overall metrics; each layer "
+                        "scored independently in by_layer"
+                    ),
+                    "lenses": {
+                        str(index): {
+                            **report(
+                                state.lens_caches[index],
+                                state.lens_summaries[index],
+                            ),
+                            "by_layer": {
+                                str(layer_idx): report(
+                                    state.lens_layer_caches[index][layer_idx],
+                                    state.lens_layer_summaries[index][layer_idx],
+                                )
+                                for layer_idx in lens_layers[index]
+                            },
+                        }
+                        for index in range(len(lenses))
+                    },
+                    "logit_lens": {
+                        **report(state.logit_cache, state.logit_summary),
+                        "by_layer": {
+                            str(layer_idx): report(
+                                state.logit_layer_caches[layer_idx],
+                                state.logit_layer_summaries[layer_idx],
+                            )
+                            for layer_idx in logit_result_layers
+                        },
                     },
                 }
-                for index in range(len(lenses))
-            },
-            "logit_lens": {
-                **report(logit_cache, logit_summary),
-                "by_layer": {
-                    str(layer_idx): report(
-                        logit_layer_caches[layer_idx],
-                        logit_layer_summaries[layer_idx],
-                    )
-                    for layer_idx in logit_result_layers
-                },
+                for label_key, state in states.items()
             },
             "prediction_rows": rows_by_lens,
         }

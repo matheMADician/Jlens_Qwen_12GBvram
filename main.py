@@ -41,13 +41,11 @@ def parse_layer_band(value: str) -> list[float]:
         ) from exc
         
 def parse_eval_target(value: str) -> str:
-    """Parse a pass@k target as transcript or a scalar label field."""
-    if value == "transcript":
-        return value
+    """Parse a pass@k target as a scalar label field."""
     if value.startswith("label.") and value[len("label."):].strip():
-        return value
+        return value[len("label."):]
     raise argparse.ArgumentTypeError(
-        "target must be 'transcript' or 'label.<field>', e.g. label.emotion"
+        "target must be 'label.<field>', e.g. label.emotion"
     )
 
 
@@ -108,7 +106,6 @@ def build_parser() -> argparse.ArgumentParser:
         default="original",
         help="Use upstream prompt-count weights or an equal average across checkpoints.",
     )
-
     evaluate = commands.add_parser(
         "eval-jlens",
         help="Call Master.eval_Jlens to evaluate a trained JLens.",
@@ -118,7 +115,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--lens-path",
         action="append",
         dest="lens_paths",
-        help="Lens checkpoint; repeat to merge checkpoints in memory.",
+        help=(
+            "Lens checkpoint; repeat to merge checkpoints, or combine with "
+            "--evaluate-lenses-independently to score each lens separately."
+        ),
     )
     evaluate.add_argument(
         "--merge-method",
@@ -126,14 +126,23 @@ def build_parser() -> argparse.ArgumentParser:
         default="original",
         help="Merge multiple lenses using upstream prompt weights or an equal average.",
     )
+    evaluate.add_argument(
+        "--evaluate-lenses-independently",
+        action="store_true",
+        help=(
+            "Evaluate each checkpoint independently while sharing one model "
+            "forward per prompt. Requires multiple --lens-path arguments."
+        ),
+    )
     evaluate.add_argument("--prompts-path", default=DEFAULT_PROMPTS_PATH)
     evaluate.add_argument(
         "--target",
         type=parse_eval_target,
-        default="transcript",
+        action="append",
+        required=True,
         help=(
-            "Pass@k reference: transcript (default) or a scalar label field, "
-            "such as label.emotion."
+            "Scalar label field to score, such as label.emotion; repeat for "
+            "additional fields. Transcript targets are not supported."
         ),
     )
     evaluate.add_argument(
@@ -340,7 +349,6 @@ def main() -> None:
             )
         )
         return
-
     if args.command == "test-training" and not args.run_name:
         parser.error("test-training requires --run-name")
     if args.command == "info-jlens" and args.no_norm_scaling and not args.use_j_vectors:
@@ -349,6 +357,12 @@ def main() -> None:
         parser.error("--no-norm-scaling requires --use-j-vectors")
     if args.command == "eval-jlens" and not args.lens_paths:
         args.lens_paths = [DEFAULT_LENS_PATH]
+    if (
+        args.command == "eval-jlens"
+        and args.evaluate_lenses_independently
+        and len(args.lens_paths) < 2
+    ):
+        parser.error("--evaluate-lenses-independently requires multiple --lens-path arguments")
     master = Master(run_name=args.run_name, settings_path=args.settings_file)
 
     if args.command == "eval-jlens":
@@ -358,7 +372,8 @@ def main() -> None:
             top_k=args.top_k,
             layer=args.layer,
             merge_method=args.merge_method,
-            target=args.target,
+            label_keys=args.target,
+            evaluate_lenses_independently=args.evaluate_lenses_independently,
         )
     elif args.command == "eval-swap":
         master.eval_swap(

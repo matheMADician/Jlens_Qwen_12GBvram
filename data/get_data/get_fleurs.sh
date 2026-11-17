@@ -16,36 +16,35 @@
 # ``--no-streaming``: Load the complete split instead of streaming it.
 # ``--overwrite``: Replace an existing ``prompts.jsonl`` file.
 
+languages=(
+	"fi_fi"
+	"ka_ge"
+	"tr_tr"
+	"ar_eg"
+	"hi_in"
+	"ta_in"
+	"th_th"
+	"vi_vn"
+	"id_id"
+	"ja_jp"
+	"cmn_hans_cn"
+	"cmn_hant_tw"
+	"cmn_hant_hk"
+	"en_us"
+	"de_de"
+)
 
-python data/get_data.py \
-	--dataset google/fleurs \
-	--config cmn_hans_cn \
-	--split train \
-	--target 250 \
-	--seed 42 \
-	--output data/datasets/fleurs/cmn_hans_cn \
-	--audio-column audio \
-	--transcription transcription \
-	--overwrite
+for lang in "${languages[@]}"; do
+	python data/get_data.py \
+		--dataset google/fleurs \
+		--config "$lang" \
+		--split train \
+		--target 100 \
+		--seed 42 \
+		--output "data/datasets/fleurs/$lang" \
+		--audio-column audio \
+		--transcription transcription \
+		--overwrite
+done
 
-python data/get_data.py \
-	--dataset google/fleurs \
-	--config en_us \
-	--split train \
-	--target 250 \
-	--seed 42 \
-	--output data/datasets/fleurs/en_us \
-	--audio-column audio \
-	--transcription transcription \
-	--overwrite
-
-python data/get_data.py \
-	--dataset google/fleurs \
-	--config de_de \
-	--split train \
-	--target 250 \
-	--seed 42 \
-	--output data/datasets/fleurs/de_de \
-	--audio-column audio \
-	--transcription transcription \
-	--overwrite
+cp "$0" "data/datasets/fleurs/get_fleurs.sh"

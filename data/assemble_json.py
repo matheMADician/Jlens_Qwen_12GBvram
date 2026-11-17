@@ -49,6 +49,25 @@ from pathlib import Path
 from typing import Any
 
 PROMPT_LINE = re.compile(r"^\s*\d+[.)]\s+(.+?)\s*$")
+ESD_LABEL_VALUE_MAP = {
+	"emotion": {
+		"anger": "angry",
+		"angry": "angry",
+		"happiness": "happy",
+		"happy": "happy",
+		"neutral": "neutral",
+		"sad": "sad",
+		"sadness": "sad",
+		"surprise": "surprised",
+		"surprised": "surprised",
+	},
+	"language": {
+		"en": "english",
+		"english": "english",
+		"zh": "chinese",
+		"chinese": "chinese",
+	},
+}
 
 
 def load_jsonl(path: Path) -> list[dict[str, Any]]:
@@ -121,6 +140,25 @@ def write_dataset_counts(manifest_path: Path, counts_path: Path) -> None:
 	with counts_path.open("w", encoding="utf-8") as handle:
 		for dataset_name, count in sorted(counts.items()):
 			handle.write(f"{dataset_name}\t{count}\n")
+
+
+def normalize_esd_labels(labels: dict[str, Any]) -> dict[str, Any]:
+	"""Normalize ESD label wording for evaluation targets."""
+	normalized_labels = dict(labels)
+	for label_key, value_map in ESD_LABEL_VALUE_MAP.items():
+		value = normalized_labels.get(label_key)
+		if value is None:
+			continue
+		if not isinstance(value, str):
+			raise ValueError(
+				f"ESD label {label_key!r} must be a scalar string, got "
+				f"{type(value).__name__}."
+			)
+		normalized_value = value_map.get(value.strip().casefold())
+		if normalized_value is None:
+			raise ValueError(f"Unsupported ESD {label_key} label {value!r}.")
+		normalized_labels[label_key] = normalized_value
+	return normalized_labels
 
 
 def get_user_prompt(record: dict[str, Any]) -> str | None:
@@ -334,6 +372,46 @@ def stratified_sample_indices(
 	return selected
 
 
+def load_used_sample_keys(path: Path) -> set[tuple[str, int]]:
+	"""Load source dataset/index pairs from a used-samples JSONL file."""
+	used_samples: set[tuple[str, int]] = set()
+	for line_number, raw_line in enumerate(
+		path.expanduser().open("r", encoding="utf-8"),
+		start=1,
+	):
+		if not raw_line.strip():
+			continue
+		try:
+			record: Any = json.loads(raw_line)
+		except json.JSONDecodeError as exc:
+			raise ValueError(
+				f"Invalid JSON in used-samples file {path}, line {line_number}: "
+				f"{exc.msg}"
+			) from exc
+		if not isinstance(record, dict):
+			raise ValueError(
+				f"Expected a JSON object in {path}, line {line_number}."
+			)
+		source_dataset = record.get("source_dataset")
+		source_index = record.get("source_index")
+		if not isinstance(source_dataset, str) or not source_dataset.strip():
+			raise ValueError(
+				f"Missing source_dataset in used-samples file {path}, "
+				f"line {line_number}."
+			)
+		if (
+			not isinstance(source_index, int)
+			or isinstance(source_index, bool)
+			or source_index < 0
+		):
+			raise ValueError(
+				f"Invalid source_index in used-samples file {path}, "
+				f"line {line_number}."
+			)
+		used_samples.add((source_dataset.strip(), source_index))
+	return used_samples
+
+
 def sample_dataset_records(
 	dataset_dir: Path,
 	dataset_name: str,
@@ -343,12 +421,17 @@ def sample_dataset_records(
 	existing_records: list[dict[str, Any]],
 	data_root: Path | None = None,
 	stratify_labels: list[str] | None = None,
+	used_samples: set[tuple[str, int]] | None = None,
+	empty_prompt: bool = False,
+	label_overrides: dict[str, str] | None = None,
 ) -> list[dict[str, Any]]:
 	dataset_name = dataset_name.strip()
 	if not dataset_name:
 		raise ValueError("--dataset_name must not be empty")
 	if count < 1:
 		raise ValueError("--count must be at least 1")
+	if empty_prompt and prompt_file is not None:
+		raise ValueError("--empty-prompt cannot be combined with --prompt-file")
 
 	source_root = dataset_dir.expanduser().resolve()
 	root = (data_root.expanduser().resolve() if data_root else infer_data_root(source_root))
@@ -358,7 +441,9 @@ def sample_dataset_records(
 		raise ValueError(f"No records found in {manifest_path}")
 
 	prompts = load_prompts(prompt_file.expanduser()) if prompt_file else None
-	if prompts is None:
+	if empty_prompt:
+		candidate_indices = list(range(len(records)))
+	elif prompts is None:
 		candidate_indices = [
 			index for index, record in enumerate(records)
 			if get_user_prompt(record) is not None
@@ -366,10 +451,41 @@ def sample_dataset_records(
 		if not candidate_indices:
 			raise ValueError(
 				f"No non-empty user prompts found in {manifest_path}; "
-				"provide --prompt-file"
+				"provide --prompt-file or explicitly select --empty-prompt"
 			)
 	else:
 		candidate_indices = list(range(len(records)))
+
+	source_dataset = dataset_label(source_root)
+	if used_samples:
+		available_indices: list[int] = []
+		excluded_count = 0
+		for index in candidate_indices:
+			source_index = records[index].get("source_index")
+			if (
+				not isinstance(source_index, int)
+				or isinstance(source_index, bool)
+				or source_index < 0
+			):
+				raise ValueError(
+					f"Record {records[index].get('id', index)!r} in {manifest_path} "
+					"has no non-negative integer source_index, required when "
+					"--used-samples is provided."
+				)
+			if (source_dataset, source_index) in used_samples:
+				excluded_count += 1
+			else:
+				available_indices.append(index)
+		candidate_indices = available_indices
+		print(
+			f"Excluded {excluded_count} already-used records from "
+			f"{source_dataset}; {len(candidate_indices)} candidates remain."
+		)
+		if not candidate_indices:
+			raise ValueError(
+				f"No unused records remain in {manifest_path} after applying "
+				"--used-samples."
+			)
 
 	rng = random.Random(seed)
 	selected_indices = (
@@ -383,8 +499,9 @@ def sample_dataset_records(
 		if stratify_labels
 		else rng.sample(candidate_indices, count)
 	)
-	source_dataset = dataset_label(source_root)
-	if prompts is not None:
+	if empty_prompt:
+		selected_prompts = [""] * len(selected_indices)
+	elif prompts is not None:
 		selected_prompts = [rng.choice(prompts) for _ in selected_indices]
 	else:
 		selected_prompts = [
@@ -403,6 +520,15 @@ def sample_dataset_records(
 	for offset, (index, prompt) in enumerate(zip(selected_indices, selected_prompts)):
 		record = copy.deepcopy(records[index])
 		record.setdefault("label", {})
+		if dataset_name.casefold() == "esd" and isinstance(record["label"], dict):
+			record["label"] = normalize_esd_labels(record["label"])
+		if label_overrides:
+			if not isinstance(record["label"], dict):
+				raise ValueError(
+					f"Record {record.get('id', index)!r} has a non-mapping label; "
+					"cannot apply label overrides."
+				)
+			record["label"].update(label_overrides)
 		original_id = str(record.get("id", index))
 		record["id"] = str(next_id + offset)
 		record["source_id"] = original_id
@@ -451,12 +577,36 @@ def parse_args() -> argparse.Namespace:
 		),
 	)
 	parser.add_argument(
+		"--label-overrides",
+		nargs="+",
+		metavar="KEY=VALUE",
+		default=None,
+		help="Set or replace label values on every assembled record",
+	)
+	parser.add_argument(
+		"--used-samples",
+		type=Path,
+		default=None,
+		help=(
+			"JSONL file of used source_dataset/source_index pairs to exclude "
+			"before sampling."
+		),
+	)
+	parser.add_argument(
 		"--prompt-file",
 		type=Path,
 		default=None,
 		help=(
 			"Optional text file of prompts. If omitted, records must already "
 			"contain non-empty user prompts."
+		),
+	)
+	parser.add_argument(
+		"--empty-prompt",
+		action="store_true",
+		help=(
+			"Use an empty user text prompt for every selected record. This is "
+			"explicitly required when source records have no non-empty prompt."
 		),
 	)
 	parser.add_argument(
@@ -485,6 +635,14 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
 	args = parse_args()
+	label_overrides: dict[str, str] = {}
+	for item in args.label_overrides or []:
+		key, separator, value = item.partition("=")
+		if not separator or not key or not value:
+			raise ValueError(
+				f"Invalid --label-overrides value {item!r}; expected KEY=VALUE."
+			)
+		label_overrides[key] = value
 	output_dir = args.output.expanduser().resolve()
 	output_dir.mkdir(parents=True, exist_ok=True)
 	output_path = output_dir / "prompts.jsonl"
@@ -498,6 +656,11 @@ def main() -> None:
 	existing_records = (
 		[] if args.override or not output_path.exists() else load_jsonl(output_path)
 	)
+	used_samples = (
+		load_used_sample_keys(args.used_samples)
+		if args.used_samples is not None
+		else None
+	)
 	for record in existing_records:
 		normalize_existing_audio_path(record, output_dir, data_root, output_path)
 	new_records = sample_dataset_records(
@@ -505,10 +668,13 @@ def main() -> None:
 		dataset_name=args.dataset_name,
 		count=args.count,
 		prompt_file=args.prompt_file,
+		empty_prompt=args.empty_prompt,
+		label_overrides=label_overrides,
 		seed=args.seed,
 		existing_records=existing_records,
 		data_root=data_root,
 		stratify_labels=args.stratify_labels,
+		used_samples=used_samples,
 	)
 
 	all_records = existing_records + new_records

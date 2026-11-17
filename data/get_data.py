@@ -5,7 +5,8 @@ Arguments:
 * ``--dataset``: Hugging Face dataset ID (required).
 * ``--config``: Dataset configuration, if required by the dataset.
 * ``--split``: Dataset split to download (default: ``train``).
-* ``--target``: Maximum number of samples to save; omit to process the full split.
+* ``--target``: Number of samples to save; stratified sampling rounds it up to
+  the next multiple of the number of strata.
 * ``--stratify-column``: Randomly sample equal counts from each value in one
   categorical column. ``--stratify-columns`` balances joint combinations.
   Both require ``--target`` and scan the complete split.
@@ -80,7 +81,12 @@ def parse_args() -> argparse.Namespace:
 	parser.add_argument("--dataset", required=True, help="Hugging Face dataset id")
 	parser.add_argument("--config", default=None, help="Optional dataset config")
 	parser.add_argument("--split", default="train", help="Dataset split")
-	parser.add_argument("--target", type=int, default=None, help="Maximum samples")
+	parser.add_argument(
+		"--target",
+		type=int,
+		default=None,
+		help="Sample count; stratified sampling rounds up to a multiple of strata",
+	)
 	parser.add_argument(
 		"--stratify-column",
 		default=None,
@@ -222,7 +228,7 @@ def stratified_sample_indices(
 	target: int,
 	seed: int,
 ) -> list[int]:
-	"""Choose an exact, reproducible equal-count sample across strata."""
+	"""Choose a reproducible equal-count sample, rounding target up if needed."""
 	if target <= 0:
 		raise ValueError("--target must be a positive integer for stratified sampling.")
 	if target > len(labels):
@@ -246,10 +252,19 @@ def stratified_sample_indices(
 				f"Cannot stratify: label at row {index} is not hashable."
 			) from exc
 
-	if target % len(indices_by_label) != 0:
+	strata_count = len(indices_by_label)
+	adjusted_target = ((target + strata_count - 1) // strata_count) * strata_count
+	if adjusted_target != target:
+		LOGGER.info(
+			"Rounding --target from %d up to %d for equal sampling across %d strata",
+			target,
+			adjusted_target,
+			strata_count,
+		)
+	target = adjusted_target
+	if target > len(labels):
 		raise ValueError(
-			f"--target {target} must be divisible by the number of strata "
-			f"({len(indices_by_label)}) to sample them equally."
+			f"Rounded target {target} exceeds the {len(labels)} rows in the split."
 		)
 
 	rng = random.Random(seed)

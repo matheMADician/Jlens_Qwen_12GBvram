@@ -6,6 +6,8 @@
 # ``--config``: Dataset configuration, if required by the dataset.
 # ``--split``: Dataset split to download (default: ``train``).
 # ``--target``: Maximum number of samples to save; omit to process the full split.
+# ``--stratify-columns``: Balance every joint label combination equally.
+# ``--label-columns``: Keep the selected metadata columns in each JSONL label mapping.
 # ``--output``: Output directory for audio and ``prompts.jsonl``.
 # ``--audio-column``: Dataset column containing audio (default: ``audio``).
 # ``--transcription``: Dataset column for the top-level transcript field;
@@ -18,7 +20,12 @@
 
 set -euo pipefail
 
-datasets=("AnimalQA" "GenderQA" "EmotionQA" "LanguageQA")
+datasets=(
+	"AnimalQA"
+	"GenderQA"
+	"EmotionQA"
+	"LanguageQA"
+)
 
 for dataset in "${datasets[@]}"; do
 	python data/get_data.py \
@@ -27,7 +34,7 @@ for dataset in "${datasets[@]}"; do
 		--target 500 \
 		--output "data/datasets/SAKURA/${dataset}" \
 		--audio-column audio \
-		--transcription attribute_label \
+		--label-columns attribute_label \
 		--prompt-column multi_instruction \
 		--overwrite
 done

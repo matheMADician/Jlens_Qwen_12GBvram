@@ -1,4 +1,5 @@
 import os, sys, torch, json, logging, csv, tempfile, math
+from urllib.parse import quote
 from dataclasses import asdict
 
 import model.model as M
@@ -1001,12 +1002,13 @@ class Master:
         self,
         lens_paths: list[str],
         prompts_path: str,
+        label_keys: list[str],
         top_k: int | None = None,
         layer: int | None = None,
         merge_method: str = "original",
-        target: str = "transcript",
+        evaluate_lenses_independently: bool = False,
     ) -> str:
-        """Evaluate pass@k with both JLens and LogitLens predictions."""
+        """Evaluate pass@k with one merged or multiple independent JLens."""
         # Prepare evaluation and output settings.
         evaluation_settings = self.settings["experiment"]["pass_k_AUC"]
         k_values = evaluation_settings.get("k_values")
@@ -1017,109 +1019,220 @@ class Master:
             task_name,
         )
 
-        # Evaluate both lenses on the prompt set.
-        from jacobian_lens.jlens.lens import JacobianLens
-
         if not lens_paths:
             raise ValueError("At least one lens checkpoint is required.")
-        merged_lens = self._merge_lenses(lens_paths, merge_method)
-        self.model.lens = J.Jlens(logger=self.logger)
-        self.model.lens.lens = merged_lens
-        evaluation = Experiments.passk_Jlens(
-            logger=self.logger,
-            model=self.model,
-            run_name=task_name,
-            prompts_path=prompts_path,
-            data_root=self._configured_data_root(),
-            top_k=csv_top_k,
-            k_values=k_values,
-            layer=layer,
-            target=target,
-        )
-
-        # Separate and validate prediction rows.
-        prediction_rows = evaluation.pop("prediction_rows")
-        if not isinstance(prediction_rows, list) or any(
-            not isinstance(row, dict) for row in prediction_rows
-        ):
-            raise RuntimeError("JLens evaluation returned invalid prediction rows.")
-
-        # Save token predictions to CSV.
         os.makedirs(output_root, exist_ok=True)
-        csv_path = os.path.join(output_root, f"{task_name}.csv")
-        write_header = not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
-        with open(csv_path, "a", newline="", encoding="utf-8-sig") as output_file:
-            writer = csv.DictWriter(
-                output_file,
-                fieldnames=self.model.lens_cache.CSV_FIELDNAMES,
+
+        if evaluate_lenses_independently:
+            if len(lens_paths) < 2:
+                raise ValueError(
+                    "Independent lens evaluation requires at least two checkpoints."
+                )
+            lens_names = [
+                os.path.splitext(os.path.basename(path))[0].removeprefix("lens_")
+                for path in lens_paths
+            ]
+            if len(set(lens_names)) != len(lens_names):
+                raise ValueError(
+                    "Independent lens checkpoint filenames must be unique."
+                )
+            wrappers = []
+            for path in lens_paths:
+                wrapper = Jlens(logger=self.logger)
+                wrapper.lens = JacobianLens.load(path)
+                wrappers.append(wrapper)
+            batch_evaluation = Experiments.passk_Jlens(
+                logger=self.logger,
+                model=self.model,
+                run_name=task_name,
+                prompts_path=prompts_path,
+                data_root=self._configured_data_root(),
+                top_k=csv_top_k,
+                k_values=k_values,
+                layer=layer,
+                label_keys=label_keys,
+                do_batch=True,
+                lens=wrappers,
             )
-            if write_header:
-                writer.writeheader()
-            writer.writerows(prediction_rows)
+            batch_label_results = batch_evaluation.get("label_results")
+            batch_rows = batch_evaluation.get("prediction_rows")
+            if not isinstance(batch_label_results, dict) or not isinstance(batch_rows, dict):
+                raise RuntimeError("Batch JLens evaluation returned invalid results.")
 
-        # Save aggregate and per-layer metrics to JSON.
-        report_path = os.path.join(
-            output_root,
-            f"{task_name}_passk_auc.json",
-        )
-        with open(report_path, "w", encoding="utf-8") as report_file:
-            json.dump(evaluation, report_file, indent=2)
-
-        # Validate layer results and align both lenses.
-        per_layer = evaluation.get("by_layer")
-        if not isinstance(per_layer, dict) or not per_layer:
-            raise RuntimeError("JLens evaluation returned no per-layer pass@k results.")
-        jlens_by_layer = per_layer.get("jlens")
-        logit_lens_by_layer = per_layer.get("logit_lens")
-        if not isinstance(jlens_by_layer, dict) or not isinstance(
-            logit_lens_by_layer, dict
-        ):
-            raise RuntimeError("Per-layer results are missing JLens or LogitLens data.")
-        layers = sorted(int(layer_name) for layer_name in jlens_by_layer)
-        if [str(layer_idx) for layer_idx in layers] != sorted(
-            logit_lens_by_layer, key=int
-        ):
-            raise RuntimeError("Per-layer JLens and LogitLens results do not align.")
-
-        # Collect normalized AUC values in layer order.
-        def layer_aucs(
-            lens_results: dict[str, object],
-            lens_name: str,
-        ) -> list[float]:
-            aucs: list[float] = []
-            for layer_idx in layers:
-                layer_result = lens_results[str(layer_idx)]
-                if not isinstance(layer_result, dict):
+            evaluations: list[
+                tuple[str, str, dict[str, object], list[dict[str, object]]]
+            ] = []
+            for lens_index, (lens_name, lens_path) in enumerate(
+                zip(lens_names, lens_paths)
+            ):
+                prediction_rows = batch_rows.get(str(lens_index))
+                if not isinstance(prediction_rows, list) or any(
+                    not isinstance(row, dict) for row in prediction_rows
+                ):
                     raise RuntimeError(
-                        f"Invalid {lens_name} result for layer {layer_idx}."
+                        f"Invalid prediction rows for lens {lens_path!r}."
                     )
-                auc = layer_result.get("normalized_auc")
-                if not isinstance(auc, (int, float)):
-                    raise RuntimeError(
-                        f"Missing {lens_name} AUC for layer {layer_idx}."
-                    )
-                aucs.append(float(auc))
-            return aucs
+                label_results: dict[str, object] = {}
+                for label_key, result in batch_label_results.items():
+                    if not isinstance(result, dict):
+                        raise RuntimeError(
+                            f"Invalid pass@k results for label {label_key!r}."
+                        )
+                    all_lenses = result.get("lenses")
+                    if not isinstance(all_lenses, dict):
+                        raise RuntimeError(
+                            f"Missing lens results for label {label_key!r}."
+                        )
+                    selected_lens = all_lenses.get(str(lens_index))
+                    if not isinstance(selected_lens, dict):
+                        raise RuntimeError(
+                            f"Missing independent lens {lens_index} for "
+                            f"label {label_key!r}."
+                        )
+                    label_results[label_key] = {
+                        **result,
+                        "lens_path": lens_path,
+                        "lenses": {"0": selected_lens},
+                    }
+                evaluations.append(
+                    (lens_name, lens_path, label_results, prediction_rows)
+                )
+        else:
+            merged_lens = self._merge_lenses(lens_paths, merge_method)
+            jlens_wrapper = Jlens(logger=self.logger)
+            jlens_wrapper.lens = merged_lens
+            self.model.lens = jlens_wrapper
+            evaluation = Experiments.passk_Jlens(
+                logger=self.logger,
+                model=self.model,
+                run_name=task_name,
+                prompts_path=prompts_path,
+                data_root=self._configured_data_root(),
+                top_k=csv_top_k,
+                k_values=k_values,
+                layer=layer,
+                label_keys=label_keys,
+            )
+            prediction_rows = evaluation.get("prediction_rows")
+            label_results = evaluation.get("label_results")
+            if not isinstance(prediction_rows, list) or any(
+                not isinstance(row, dict) for row in prediction_rows
+            ):
+                raise RuntimeError("JLens evaluation returned invalid prediction rows.")
+            if not isinstance(label_results, dict):
+                raise RuntimeError("JLens evaluation returned invalid label results.")
+            evaluations = [("", "", label_results, prediction_rows)]
 
-        # Plot JLens and LogitLens AUC by layer.
-        layer_auc_plot_path = os.path.join(
-            output_root,
-            f"{task_name}_passk_auc_by_layer.png",
-        )
-        MathTools.draw_line_graph(
-            data={
-                "JLens": layer_aucs(jlens_by_layer, "JLens"),
-                "LogitLens": layer_aucs(logit_lens_by_layer, "LogitLens"),
-            },
-            png_path=layer_auc_plot_path,
-            x_values=layers,
-            title="Pass@k AUC by layer",
-            x_axis_label="Layer",
-            y_axis_label="Normalized AUC over log(k)",
-        )
-        self.logger.info("Saved inference predictions to %s", csv_path)
-        self.logger.info("Saved pass@k evaluation to %s", report_path)
-        self.logger.info("Saved pass@k AUC-by-layer plot to %s", layer_auc_plot_path)
+        expected_labels = set(label_keys)
+        for lens_name, lens_path, label_results, prediction_rows in evaluations:
+            if set(label_results) != expected_labels:
+                raise RuntimeError("JLens evaluation returned unexpected label results.")
+            file_prefix = task_name
+            if evaluate_lenses_independently:
+                file_prefix += f"_lens_{quote(lens_name, safe='')}"
+            csv_path = os.path.join(output_root, f"{file_prefix}.csv")
+            write_header = (
+                not os.path.exists(csv_path) or os.path.getsize(csv_path) == 0
+            )
+            with open(csv_path, "a", newline="", encoding="utf-8-sig") as output_file:
+                writer = csv.DictWriter(
+                    output_file,
+                    fieldnames=self.model.lens_cache.CSV_FIELDNAMES,
+                )
+                if write_header:
+                    writer.writeheader()
+                writer.writerows(prediction_rows)
+
+            for label_key, label_evaluation in label_results.items():
+                if not isinstance(label_evaluation, dict):
+                    raise RuntimeError(
+                        f"Invalid pass@k results for label {label_key!r}."
+                    )
+                safe_label = quote(label_key, safe="")
+                report_path = os.path.join(
+                    output_root,
+                    f"{file_prefix}_label_{safe_label}_passk_auc.json",
+                )
+                with open(report_path, "w", encoding="utf-8") as report_file:
+                    json.dump(label_evaluation, report_file, indent=2)
+
+                jlens = label_evaluation.get("lenses")
+                logit_lens = label_evaluation.get("logit_lens")
+                if not isinstance(jlens, dict) or not isinstance(logit_lens, dict):
+                    raise RuntimeError(
+                        f"Pass@k results are missing lenses for {label_key!r}."
+                    )
+                single_lens = jlens.get("0")
+                jlens_by_layer = (
+                    single_lens.get("by_layer")
+                    if isinstance(single_lens, dict)
+                    else None
+                )
+                logit_lens_by_layer = logit_lens.get("by_layer")
+                if not isinstance(jlens_by_layer, dict) or not isinstance(
+                    logit_lens_by_layer, dict
+                ):
+                    raise RuntimeError(
+                        f"Per-layer results are missing for {label_key!r}."
+                    )
+                layers = sorted(int(layer_name) for layer_name in jlens_by_layer)
+                if [str(layer_idx) for layer_idx in layers] != sorted(
+                    logit_lens_by_layer, key=int
+                ):
+                    raise RuntimeError(
+                        f"Per-layer results do not align for {label_key!r}."
+                    )
+
+                def layer_aucs(
+                    results: dict[str, object], lens_title: str
+                ) -> list[float]:
+                    values: list[float] = []
+                    for layer_idx in layers:
+                        item = results[str(layer_idx)]
+                        if not isinstance(item, dict):
+                            raise RuntimeError(
+                                f"Invalid {lens_title} result at layer {layer_idx}."
+                            )
+                        auc = item.get("normalized_auc")
+                        if not isinstance(auc, (int, float)):
+                            raise RuntimeError(
+                                f"Missing {lens_title} AUC at layer {layer_idx}."
+                            )
+                        values.append(float(auc))
+                    return values
+
+                if evaluate_lenses_independently:
+                    label_plot_dir = os.path.join(output_root, safe_label)
+                    os.makedirs(label_plot_dir, exist_ok=True)
+                    layer_auc_plot_path = os.path.join(
+                        label_plot_dir,
+                        f"{quote(lens_name, safe='')}.png",
+                    )
+                else:
+                    layer_auc_plot_path = os.path.join(
+                        output_root,
+                        f"{file_prefix}_label_{safe_label}_passk_auc_by_layer.png",
+                    )
+                MathTools.draw_line_graph(
+                    data={
+                        "JLens": layer_aucs(jlens_by_layer, "JLens"),
+                        "LogitLens": layer_aucs(logit_lens_by_layer, "LogitLens"),
+                    },
+                    png_path=layer_auc_plot_path,
+                    x_values=layers,
+                    title=f"Pass@k AUC by layer: {lens_name or 'JLens'} / {label_key}",
+                    x_axis_label="Layer",
+                    y_axis_label="Normalized AUC over log(k)",
+                )
+                self.logger.info("Saved pass@k evaluation to %s", report_path)
+                self.logger.info(
+                    "Saved pass@k AUC-by-layer plot to %s", layer_auc_plot_path
+                )
+            self.logger.info(
+                "Saved inference predictions for %s to %s",
+                lens_path or "JLens",
+                csv_path,
+            )
         return output_root
     
     def eval_swap(

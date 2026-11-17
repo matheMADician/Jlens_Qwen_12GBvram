@@ -1,0 +1,22 @@
+[
+  {"id": "p00_none", "group": "none", "text": ""},
+  {"id": "p01_src_type", "group": "source", "text": "What type of sound is that?"},
+  {"id": "p02_src_identify", "group": "source", "text": "Can you identify the source of that noise?"},
+  {"id": "p03_src_vehicle", "group": "source", "text": "Can you identify the type of vehicle making that noise?"},
+  {"id": "p04_src_animal", "group": "source", "text": "Can you identify the type of animal making that noise?"},
+  {"id": "p05_src_object", "group": "source", "text": "Can you identify the type of object making that noise?"},
+  {"id": "p06_level_loud_soft", "group": "level", "text": "Is that sound loud or soft?"},
+  {"id": "p07_level_getting_louder", "group": "level", "text": "Is the sound getting louder or softer?"},
+  {"id": "p08_level_energy", "group": "level", "text": "Is the sound a high-energy or low-energy sound?"},
+  {"id": "p09_time_repetitive", "group": "temporal", "text": "Is that sound repetitive or one-time?"},
+  {"id": "p10_time_start_stop", "group": "temporal", "text": "Can you tell me when the sound starts and stops?"},
+  {"id": "p11_time_constant", "group": "temporal", "text": "Is the sound constant or does it change over time?"},
+  {"id": "p12_time_events", "group": "temporal", "text": "Is the sound a single event or a series of events?"},
+  {"id": "p13_scene_atmosphere", "group": "scene", "text": "Can you describe the overall atmosphere of the audio?"},
+  {"id": "p14_scene_environment", "group": "scene", "text": "Can you describe the sound as it relates to the environment (e.g. ocean, forest, city)?"},
+  {"id": "p15_scene_natural", "group": "scene", "text": "Is that sound a natural sound or a man-made sound?"},
+  {"id": "p16_count_how_many", "group": "multiplicity", "text": "How many different sounds can you hear in this audio?"},
+  {"id": "p17_count_combination", "group": "multiplicity", "text": "Is the sound a single sound or a combination of multiple sounds?"},
+  {"id": "p18_offdomain_language", "group": "off_domain", "text": "What language is being spoken in this audio?"},
+  {"id": "p19_offdomain_emotion", "group": "off_domain", "text": "Can you identify the speaker's emotional state in this audio?"}
+]

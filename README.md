@@ -250,7 +250,8 @@ vanilla Logit Lens baseline，並保存到另一份 cache。
 `main.py` 使用子命令選擇要呼叫的 `Master` 方法：
 
 ```bash
-python main.py eval-jlens --lens-path path/to/lens.pt --prompts-path path/to/prompts.jsonl
+python main.py eval-jlens --lens-path path/to/lens.pt --prompts-path path/to/prompts.jsonl --target label.emotion
+python main.py eval-jlens --lens-path path/to/lens_a.pt --lens-path path/to/lens_b.pt --evaluate-lenses-independently --prompts-path path/to/prompts.jsonl --target label.emotion
 python main.py generate --prompts-path path/to/prompts.jsonl --max-new-tokens 128 --run-name generated
 python main.py info-jlens --lens-path path/to/lens.pt
 python main.py comp-jlens --lens-path1 path/to/lens1.pt --lens-path2 path/to/lens2.pt
@@ -263,13 +264,18 @@ python main.py test-lens
 分別對應 `Master.eval_Jlens()`、`generate()`、`info_Jlens()`、`comp_Jlens()`、
 `calc_Jlens_experiment()` 和三個 testing methods。評估 JLens 時，可以用
 `--layer` 指定單一層、`--top-k` 設定 CSV 顯示的候選 token 數量，並用
-`--run-name` 指定輸出名稱；不指定 layer 時會評估所有可用層。每個 prompt
-只執行一次 `apply_lens`，同時計算 JLens 與 LogitLens 的 pass@k。CSV 同時包含兩種
-預測；JSON 報告在頂層提供 JLens 指標，並在 `logit_lens` 欄位提供 LogitLens
-指標。報告也會在 `by_layer` 下提供各層的獨立指標，並輸出
-`<run-name>_passk_auc_by_layer.png` 比較 JLens 與 LogitLens 的 normalized AUC。
-每層分數仍在該層的所有 prompt positions 中取最佳答案 token rank；因此這是
+`--run-name` 指定輸出名稱；需使用 `--target label.<field>` 選擇標量 label 欄位，
+並可重複指定多個欄位，例如 `--target label.emotion --target label.gender`。
+不支援以 transcript 作為 pass@k 答案。每個 prompt 只執行一次模型 forward，
+所有選取 label 共用該次結果，並分別保存 JSON 報告與 AUC 圖，例如
+`<run-name>_label_emotion_passk_auc.json` 和
+`<run-name>_label_emotion_passk_auc_by_layer.png`；每張圖比較 JLens 與
+LogitLens 的 normalized AUC。每層分數仍在該層的所有 prompt positions 中取最佳答案 token rank；因此這是
 layer-wise、但仍採 oracle-position 的結果。
+需要比較多個 lens 時，可重複傳入 `--lens-path` 並加上
+`--evaluate-lenses-independently`。各 lens 會保留獨立的報告與 prediction CSV，
+同一 prompt 的模型 forward 共用一次；未加此選項時，重複的 lens checkpoints
+仍會先合併再評估。
 
 `calc-jlens-experiment` 可在 `settings.json` 的 `fitting.experiment` 中設定
 `random_projection: true` 來啟用投影與 t-SNE；預設為 `false`。
@@ -305,8 +311,19 @@ python main.py calc-jlens-experiment --run-name qwen-p128-s42 --projector 128:42
 python main.py calc-jlens-experiment --run-name qwen-p256-s42 --projector 256:42
 ```
 
+不同 training runs 的 projected features 可合併成同一個 embedding；來源必須
+具有相同 projector metadata 與 source layers。圖例使用每筆資料保存的 dataset label：
+
 ```bash
-python main.py eval-jlens --run-name evaluate_run --layer 22 --top-k 10
+python tools/projection_tsne.py create \
+  --projected-dir output/checkpoints/<model>/upscale_1/experiment/projected/dim_128_seed_42 \
+  --projected-dir output/checkpoints/<model>/esd_300/experiment/projected/dim_128_seed_42 \
+  --projected-dir output/checkpoints/<model>/fsd50k_300/experiment/projected/dim_128_seed_42 \
+  --output-dir output/experiments/combined_tsne/upscale1_esd_fsd50k
+```
+
+```bash
+python main.py eval-jlens --run-name evaluate_run --layer 22 --top-k 10 --target label.emotion
 ```
 
 `generate` 會使用模型的 greedy `generate()` 對每個音訊 prompt 產生文字，
@@ -337,7 +354,8 @@ python main.py eval-jlens \
   --settings-file "$TEMP_SETTINGS" \
   --run-name audio_eval \
   --lens-path output/checkpoints/Qwen2-Audio-7B/train_1_no_SAKURA/experiment/lens_full.pt \
-  --prompts-path data/assembled/test_SAKURA_AnimalQA/prompts.jsonl
+  --prompts-path data/assembled/test_SAKURA_AnimalQA/prompts.jsonl \
+  --target 'label.<field>'
 ```
 
 `Master.create_model_settings_file()` 會複製來源設定，只更新 `model.id` 與
@@ -384,7 +402,7 @@ SVD 分析仍使用 Jacobian matrices。
 
 pass@k 會在每個 prompt 的所有輸入位置中尋找答案 token 的最低排名；指定
 `layer` 時只評估該層，未指定時則在所有可用層中取最佳排名。執行
-`python main.py eval-jlens --layer <layer>` 可指定層。
+`python main.py eval-jlens --layer <layer> --target label.<field>` 可指定層與評估標籤。
 
 ```python
 from Master import Master
