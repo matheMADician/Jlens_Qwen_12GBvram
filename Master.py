@@ -1234,7 +1234,116 @@ class Master:
                 csv_path,
             )
         return output_root
-    
+
+    def eval_peak_cover(
+        self,
+        lens_paths: list[str],
+        prompts_path: str,
+        label_keys: list[str],
+        peak_n: int | None = None,
+        position_policy: str | None = None,
+        merge_method: str = "original",
+        evaluate_lenses_independently: bool = False,
+    ) -> str:
+        """Evaluate Peakn@k and Cover@k, modeled on eval_Jlens.
+
+        Peakn@k: mean rank of the n best positions <= k (strength).
+        Cover@k: fraction of positions with rank <= k (duration).
+        Settings come from experiment.peak_cover in settings.json when present.
+        """
+        from tools.peak_cover import run_peak_cover
+
+        defaults = {
+            "k_values": [2 ** i for i in range(13)],  # 1 ... 4096
+            "peak_n": 5,
+            "position_policy": "audio",
+        }
+        settings = {**defaults, **self.settings["experiment"].get("peak_cover", {})}
+        peak_n = peak_n or int(settings["peak_n"])
+        position_policy = position_policy or settings["position_policy"]
+        task_name = self.run_name or "default"
+        output_root = os.path.join(
+            self._model_output_root(self.settings["inference"]["output_root"]),
+            task_name,
+        )
+        if not lens_paths:
+            raise ValueError("At least one lens checkpoint is required.")
+        os.makedirs(output_root, exist_ok=True)
+
+        if evaluate_lenses_independently:
+            if len(lens_paths) < 2:
+                raise ValueError("Independent lens evaluation requires at least two checkpoints.")
+            lens_names = [
+                os.path.splitext(os.path.basename(path))[0].removeprefix("lens_")
+                for path in lens_paths
+            ]
+            if len(set(lens_names)) != len(lens_names):
+                raise ValueError("Independent lens checkpoint filenames must be unique.")
+            lenses = [JacobianLens.load(path) for path in lens_paths]
+        else:
+            lens_names = ["merged" if len(lens_paths) > 1 else
+                          os.path.splitext(os.path.basename(lens_paths[0]))[0].removeprefix("lens_")]
+            lenses = [self._merge_lenses(lens_paths, merge_method)]
+
+        results = run_peak_cover(
+            logger=self.logger,
+            model=self.model,
+            run_name=task_name,
+            prompts_path=prompts_path,
+            data_root=self._configured_data_root(),
+            k_values=list(settings["k_values"]),
+            lenses=lenses,
+            label_keys=label_keys,
+            peak_n=peak_n,
+            position_policy=position_policy,
+        )
+
+        for label_key, label_result in results.items():
+            safe_label = quote(label_key, safe="")
+            label_dir = os.path.join(output_root, safe_label)
+            os.makedirs(label_dir, exist_ok=True)
+            all_lenses = label_result["lenses"]
+            logit = all_lenses["logit_lens"]
+            for index, lens_name in enumerate(lens_names):
+                lens_result = all_lenses[str(index)]
+                safe_lens = quote(lens_name, safe="")
+                report_path = os.path.join(label_dir, f"{safe_lens}_peak_cover.json")
+                with open(report_path, "w", encoding="utf-8") as report_file:
+                    json.dump(
+                        {
+                            **{k: v for k, v in label_result.items() if k != "lenses"},
+                            "lens_name": lens_name,
+                            "lens_paths": (
+                                [lens_paths[index]] if evaluate_lenses_independently else lens_paths
+                            ),
+                            "jlens": lens_result,
+                            "logit_lens": logit,
+                        },
+                        report_file,
+                        indent=2,
+                    )
+
+                layers = sorted(int(layer) for layer in lens_result["by_layer"])
+                def series(result: dict, metric: str) -> list[float]:
+                    return [float(result["by_layer"][str(l)][metric]) for l in layers]
+                plot_path = os.path.join(label_dir, f"{safe_lens}_peak_cover_by_layer.png")
+                MathTools.draw_line_graph(
+                    data={
+                        f"JLens Peak{peak_n}": series(lens_result, "peak_normalized_auc"),
+                        "JLens Cover": series(lens_result, "cover_normalized_auc"),
+                        f"LogitLens Peak{peak_n}": series(logit, "peak_normalized_auc"),
+                        "LogitLens Cover": series(logit, "cover_normalized_auc"),
+                    },
+                    png_path=plot_path,
+                    x_values=layers,
+                    title=f"Peak{peak_n}@k / Cover@k AUC by layer: {lens_name} / {label_key}",
+                    x_axis_label="Layer",
+                    y_axis_label="Normalized AUC over log(k)",
+                )
+                self.logger.info("Saved Peak/Cover evaluation to %s", report_path)
+                self.logger.info("Saved Peak/Cover AUC-by-layer plot to %s", plot_path)
+        return output_root
+
     def eval_swap(
         self,
         lens_path: str,

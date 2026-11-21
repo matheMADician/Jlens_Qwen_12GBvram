@@ -252,6 +252,22 @@ def test_swap_replaces_the_model_answer(tmp_path):
     assert {row["label_match"] for row in rows} == {True, False}
 
 
+def test_label_match_reads_the_label_field(tmp_path):
+    # Newer JSONL files store the animal in label.attribute_label, not transcript.
+    records = []
+    for sample_id, animal in ((0, "cat"), (1, "dog")):
+        record = _record(sample_id, transcript="")
+        record["label"] = {"attribute_label": animal}
+        records.append(record)
+    report = _run(
+        _model(),
+        tmp_path,
+        prompts_path=str(_prompts(tmp_path, records)),
+        direction_sources=["jlens"],
+    )
+    assert {row["label_match"] for row in report["rows"]} == {True, False}
+
+
 def test_summary_groups_every_condition(tmp_path):
     report = _run(
         _model(),
@@ -424,7 +440,9 @@ def test_cli_requires_a_lens_and_rejects_bad_bands():
 
 
 def test_existing_cli_commands_still_parse():
-    args = main.build_parser().parse_args(["eval-jlens", "--layer", "3"])
+    args = main.build_parser().parse_args(
+        ["eval-jlens", "--layer", "3", "--target", "label.attribute_label"]
+    )
     assert args.command == "eval-jlens" and args.layer == 3
     args = main.build_parser().parse_args(["generate"])
     assert args.command == "generate"

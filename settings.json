@@ -52,6 +52,7 @@
             "position_policies": ["all"],
             "alpha": 1.0,
             "clamp_to_clean": true,
+            "label_key": "attribute_label",
             "max_direction_cosine": 0.9,
             "max_prompts": 20,
             "seed": 42,

@@ -212,6 +212,7 @@ class Experiments:
         max_prompts: int | None = None,
         seed: int = 42,
         clamp_to_clean: bool = True,
+        label_key: str = "attribute_label",
     ) -> dict[str, object]:
         """Audio version of the paper's verbal-report swap experiment.
 
@@ -220,6 +221,8 @@ class Experiments:
         scored on the next token. Pairs whose directions are too similar stay in
         ``rows`` but are excluded from ``summary``, because the pseudoinverse is
         unstable for nearly parallel directions.
+        ``label_match`` compares the answer with ``sample.label[label_key]``;
+        older JSONL files without that label fall back to ``transcript``.
         """
         direction_sources = direction_sources or list(SWAP_DIRECTION_SOURCES)
         position_policies = position_policies or ["all"]
@@ -287,7 +290,7 @@ class Experiments:
                 policy: Experiments.swap_token_positions(input_ids, tokenizer, policy)
                 for policy in position_policies
             }
-            transcript = (sample.transcript or "").strip().lower()
+            reference_label = Experiments._swap_reference_label(sample, label_key)
             for word, target_token in candidates.items():
                 for band_name, layers in bands.items():
                     for direction_source in direction_sources:
@@ -309,7 +312,7 @@ class Experiments:
                                     tokenizer,
                                     result,
                                     sample_id=sample.sample_id,
-                                    label_match=transcript == source_text.strip().lower(),
+                                    label_match=reference_label == source_text.strip().lower(),
                                     source_token=source_token,
                                     target_token=target_token,
                                     target_word=word,
@@ -336,6 +339,14 @@ class Experiments:
             "summary": Experiments._summarize_swap_rows(rows),
             "rows": rows,
         }
+
+    @staticmethod
+    def _swap_reference_label(sample: ParsedSample, label_key: str) -> str:
+        """Return the lower-cased ground-truth answer used for ``label_match``."""
+        value = sample.label.get(label_key)
+        if not isinstance(value, str) or not value.strip():
+            value = sample.transcript or ""
+        return value.strip().lower()
 
     @staticmethod
     def _swap_row(

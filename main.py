@@ -158,6 +158,47 @@ def build_parser() -> argparse.ArgumentParser:
         help="Number of top predictions to write to the inference CSV.",
     )
 
+    peak_cover = commands.add_parser(
+        "eval-peak-cover",
+        help="Call Master.eval_peak_cover to score Peakn@k and Cover@k.",
+        parents=[common],
+    )
+    peak_cover.add_argument(
+        "--lens-path",
+        action="append",
+        dest="lens_paths",
+        help=(
+            "Lens checkpoint; repeat to merge checkpoints, or combine with "
+            "--evaluate-lenses-independently to score each lens separately."
+        ),
+    )
+    peak_cover.add_argument(
+        "--merge-method",
+        choices=("original", "equal"),
+        default="original",
+    )
+    peak_cover.add_argument("--evaluate-lenses-independently", action="store_true")
+    peak_cover.add_argument("--prompts-path", default=DEFAULT_PROMPTS_PATH)
+    peak_cover.add_argument(
+        "--target",
+        type=parse_eval_target,
+        action="append",
+        required=True,
+        help="Scalar label field to score, such as label.emotion; repeatable.",
+    )
+    peak_cover.add_argument(
+        "--peak-n",
+        type=int,
+        default=None,
+        help="Number of best positions averaged for Peakn@k; default experiment.peak_cover.peak_n or 5.",
+    )
+    peak_cover.add_argument(
+        "--position-policy",
+        choices=("audio", "all"),
+        default=None,
+        help="Score audio tokens only (default) or every prompt position.",
+    )
+
     swap = commands.add_parser(
         "eval-swap",
         help="Call Master.eval_swap to run the concept swap experiment.",
@@ -373,6 +414,16 @@ def main() -> None:
             layer=args.layer,
             merge_method=args.merge_method,
             label_keys=args.target,
+            evaluate_lenses_independently=args.evaluate_lenses_independently,
+        )
+    elif args.command == "eval-peak-cover":
+        master.eval_peak_cover(
+            lens_paths=args.lens_paths or [DEFAULT_LENS_PATH],
+            prompts_path=args.prompts_path,
+            label_keys=args.target,
+            peak_n=args.peak_n,
+            position_policy=args.position_policy,
+            merge_method=args.merge_method,
             evaluate_lenses_independently=args.evaluate_lenses_independently,
         )
     elif args.command == "eval-swap":

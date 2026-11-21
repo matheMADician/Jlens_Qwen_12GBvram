@@ -1,0 +1,3 @@
+What is the gender of the speaker? Answer in one word.
+What is the speaker's gender? Answer in one word.
+Describe the gender of the person speaking in one word.
