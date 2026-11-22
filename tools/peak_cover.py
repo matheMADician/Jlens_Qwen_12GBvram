@@ -355,8 +355,9 @@ def run_peak_cover(
                         cache, label_ranks, scored, sorted_k_values, peak_n,
                         layer=None if layer_key == "pooled" else layer_key,
                     )
-        logger.info("%s Peak/Cover: processed prompt %d/%d (%d scored positions)",
-                    run_name, prompt_index, len(json_lines), len(scored))
+        # print, not logger.info: Master's root logger has no handler, so info is dropped
+        print(f"{run_name} Peak/Cover: processed prompt {prompt_index}/{len(json_lines)} "
+              f"({len(scored)} scored positions)", flush=True)
 
     def report(cache: peak_cover_cache) -> dict[str, object]:
         return {
@@ -365,6 +366,7 @@ def run_peak_cover(
             "peak_layers": cache.peak_layers,
             "peak_positions": cache.peak_positions,
             "cover_layers": cache.cover_layers,
+            "cover_fractions": cache.cover_fractions,  # per prompt, per k (for error bars)
         }
 
     return {
